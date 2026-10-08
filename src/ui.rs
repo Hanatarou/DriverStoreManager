@@ -11,13 +11,13 @@ use anyhow::{anyhow, Result};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, GetMonitorInfoW, GetStockObject, InvalidateRect, MonitorFromPoint, MonitorFromRect, UpdateWindow,
+    CreateFontIndirectW, GetMonitorInfoW, GetStockObject, InvalidateRect, MonitorFromPoint, MonitorFromRect, ScreenToClient, UpdateWindow,
     DEFAULT_GUI_FONT, HBRUSH, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, SetWindowTheme, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS,
-    INITCOMMONCONTROLSEX, LVCFMT_LEFT, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGA_HEADER_LEFT, LVGF_ALIGN,
+    INITCOMMONCONTROLSEX, LVHITTESTINFO, LVM_SUBITEMHITTEST, LVCFMT_LEFT, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGA_HEADER_LEFT, LVGF_ALIGN,
     LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVIS_STATEIMAGEMASK, LVITEMW,
     LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETCOLUMNWIDTH, LVM_SETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP,
     LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVNI_SELECTED,
@@ -61,6 +61,7 @@ pub const ID_EXPORT_CHECKED: u16 = 112;
 pub const ID_EXPORT_ALL: u16 = 113;
 pub const ID_REMOVE: u16 = 114;
 pub const ID_RESTORE: u16 = 115;
+pub const ID_VERIFY_BACKUP: u16 = 116;
 pub const ID_CHECK_OLD_UNUSED: u16 = 120;
 pub const ID_CHECK_OLD_IN_USE: u16 = 121;
 pub const ID_CHECK_SHOWN: u16 = 122;
@@ -68,9 +69,11 @@ pub const ID_UNCHECK_SHOWN: u16 = 123;
 pub const ID_UNCHECK_ALL: u16 = 124;
 pub const ID_CHECK_UNUSED: u16 = 125;
 pub const ID_INVERT: u16 = 126;
+pub const ID_FOCUS_FILTER: u16 = 127;
 pub const ID_GROUP_BASE: u16 = 200; // + index into GROUP_MODES
 pub const ID_OLD_ONLY: u16 = 210;
 pub const ID_DISCONNECTED_ONLY: u16 = 211;
+pub const ID_PROBLEM_ONLY: u16 = 212;
 pub const ID_OPT_BACKUP: u16 = 220;
 pub const ID_OPT_INCLUDE_BOOT: u16 = 221;
 pub const ID_HELP_HOW: u16 = 230;
@@ -82,6 +85,8 @@ pub const ID_CTX_COPY_PATH: u16 = 243;
 pub const ID_CTX_REMOVE_SELECTED: u16 = 244;
 pub const ID_CTX_EXPORT_SELECTED: u16 = 245;
 pub const ID_CTX_DEVICE_PROPS: u16 = 246;
+pub const ID_CTX_COPY_CELL: u16 = 247;
+pub const ID_CTX_COPY_ROWS: u16 = 248;
 
 const ID_LIST: i32 = 1000;
 const ID_FILTER: u16 = 1001;
@@ -121,6 +126,8 @@ thread_local! {
     static START_MAXIMIZED: Cell<bool> = const { Cell::new(false) };
     /// The last position and size of the window while it was neither maximized nor minimized, in screen coordinates.
     static NORMAL_RECT: Cell<Option<RECT>> = const { Cell::new(None) };
+    /// The list cell (row, column) the right-click menu was opened on.
+    static CONTEXT_CELL: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
 fn handles() -> Handles {
@@ -214,6 +221,7 @@ fn build_menus() -> Result<(HMENU, HMENU)> {
         .item(ID_EXPORT_CHECKED, "Export &checked driver packages...")
         .item(ID_EXPORT_ALL, "Export a&ll driver packages...")
         .item(ID_RESTORE, "Re&store backup...")
+        .item(ID_VERIFY_BACKUP, "&Verify backup...")
         .separator()
         .item(ID_REMOVE, "&Remove checked driver packages...");
 
@@ -237,7 +245,10 @@ fn build_menus() -> Result<(HMENU, HMENU)> {
     let view = MenuBuilder::new_popup()?;
     view.submenu("&Group by", group_by.menu)
         .item(ID_OLD_ONLY, "Show only &old packages")
-        .item(ID_DISCONNECTED_ONLY, "Show only packages used only by &disconnected devices");
+        .item(ID_DISCONNECTED_ONLY, "Show only packages used only by &disconnected devices")
+        .item(ID_PROBLEM_ONLY, "Show only packages used by devices with a &problem")
+        .separator()
+        .item(ID_FOCUS_FILTER, "Go to the &filter box\tCtrl+F");
 
     // Options
     let options = MenuBuilder::new_popup()?;
@@ -269,7 +280,9 @@ fn build_menus() -> Result<(HMENU, HMENU)> {
         .separator()
         .item(ID_CTX_DEVICE_PROPS, "Open device properties")
         .item(ID_CTX_OPEN_FOLDER, "Open package folder")
-        .item(ID_CTX_COPY_PATH, "Copy package folder path");
+        .item(ID_CTX_COPY_PATH, "Copy package folder path")
+        .item(ID_CTX_COPY_CELL, "Copy cell text")
+        .item(ID_CTX_COPY_ROWS, "Copy selected rows");
 
     Ok((bar, context.menu))
 }
@@ -523,6 +536,7 @@ pub fn create_main_window(saved: Option<WindowState>) -> Result<()> {
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'E' as u16, cmd: ID_EXPORT_LIST },
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'N' as u16, cmd: ID_ADD },
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0 | FSHIFT.0), key: b'N' as u16, cmd: ID_ADD_INSTALL },
+            ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'F' as u16, cmd: ID_FOCUS_FILTER },
         ];
         let accelerators = match CreateAcceleratorTableW(&mut entries) {
             Ok(table) => table,
@@ -705,6 +719,16 @@ pub fn restore_ui() {
 }
 
 // ---- The list --------------------------------------------------------------------------------------
+
+/// Moves the keyboard focus to the filter box with its text selected (Ctrl+F).
+pub fn focus_filter() {
+    use windows::Win32::UI::Controls::EM_SETSEL;
+    let filter_box = handles().filter_box;
+    unsafe {
+        let _ = SetFocus(Some(filter_box));
+    }
+    send(filter_box, EM_SETSEL, 0, -1);
+}
 
 pub fn filter_text() -> String {
     let h = handles();
@@ -920,17 +944,41 @@ pub fn first_selected_item() -> Option<usize> {
 
 // ---- Context menu ----------------------------------------------------------------------------------
 
+/// (row, column) of the list cell at a screen position, or None when there is no row there.
+fn cell_at(list: HWND, x: i32, y: i32) -> Option<(usize, usize)> {
+    let mut point = POINT { x, y };
+    unsafe {
+        let _ = ScreenToClient(list, &mut point);
+    }
+    let mut hit = LVHITTESTINFO { pt: point, ..Default::default() };
+    let row = send(list, LVM_SUBITEMHITTEST, 0, &mut hit as *mut _ as isize).0;
+    if row < 0 || hit.iSubItem < 0 {
+        None
+    } else {
+        Some((row as usize, hit.iSubItem as usize))
+    }
+}
+
+/// The list cell the right-click menu was opened on (for "Copy cell text").
+pub fn context_cell() -> Option<(usize, usize)> {
+    CONTEXT_CELL.with(|c| c.get())
+}
+
 fn show_context_menu(lparam: LPARAM) {
     let h = handles();
     unsafe {
         let mut x = (lparam.0 & 0xFFFF) as i16 as i32;
         let mut y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-        if lparam.0 == -1 || (x == -1 && y == -1) {
+        let from_keyboard = lparam.0 == -1 || (x == -1 && y == -1);
+        if from_keyboard {
             let mut point = POINT::default();
             let _ = GetCursorPos(&mut point);
             x = point.x;
             y = point.y;
         }
+        // From the keyboard there is no mouse position: the first column of the selected row.
+        let cell = if from_keyboard { first_selected_item().map(|row| (row, 0)) } else { cell_at(h.list, x, y) };
+        CONTEXT_CELL.with(|c| c.set(cell));
         let _ = TrackPopupMenu(h.context_menu, TPM_RIGHTBUTTON, x, y, Some(0), h.form, None);
     }
 }

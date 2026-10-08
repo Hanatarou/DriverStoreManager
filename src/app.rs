@@ -104,6 +104,7 @@ pub fn apply_settings(settings: &Settings) {
     ui::set_menu_checked(ID_OPT_INCLUDE_BOOT, settings.include_boot_critical);
     ui::set_menu_checked(ID_OLD_ONLY, settings.old_only);
     ui::set_menu_checked(ID_DISCONNECTED_ONLY, settings.disconnected_only);
+    ui::set_menu_checked(ID_PROBLEM_ONLY, settings.problem_only);
     ui::set_column_widths(&settings.column_widths);
 }
 
@@ -114,6 +115,7 @@ pub fn on_closing() {
         include_boot_critical: ui::menu_checked(ID_OPT_INCLUDE_BOOT),
         old_only: ui::menu_checked(ID_OLD_ONLY),
         disconnected_only: ui::menu_checked(ID_DISCONNECTED_ONLY),
+        problem_only: ui::menu_checked(ID_PROBLEM_ONLY),
         column_widths: ui::column_widths(),
         group_mode: GROUP_MODE.with(|g| g.get()),
         sort_column: SORT_COLUMN.with(|c| c.get()),
@@ -225,6 +227,7 @@ pub fn on_command(id: u16) {
         ID_OPEN_OFFLINE => ui_action("Open offline Windows image", false, open_offline_image),
         ID_BACK_ONLINE => ui_action("Return to the running Windows", false, back_to_online),
         ID_RESTORE => ui_action("Restore backup", false, restore_backup),
+        ID_VERIFY_BACKUP => ui_action("Verify backup", false, verify_backup),
         ID_REMOVE => ui_action("Remove checked driver packages", false, remove_checked_packages),
 
         ID_CHECK_OLD_UNUSED => {
@@ -262,6 +265,17 @@ pub fn on_command(id: u16) {
                 Ok(())
             });
         }
+        ID_PROBLEM_ONLY => {
+            ui::toggle_menu_checked(ID_PROBLEM_ONLY);
+            ui_action("Show only packages used by devices with a problem", true, || {
+                applog::info(&format!(
+                    "Show only packages used by devices with a problem: {}",
+                    ps_bool(ui::menu_checked(ID_PROBLEM_ONLY))
+                ));
+                update_view();
+                Ok(())
+            });
+        }
         ID_OPT_BACKUP => {
             let value = ui::toggle_menu_checked(ID_OPT_BACKUP);
             applog::info(&format!("Option 'Back up packages before removing' is now: {}", ps_bool(value)));
@@ -289,6 +303,9 @@ pub fn on_command(id: u16) {
         ID_CTX_DEVICE_PROPS => ui_action("Open device properties", false, open_device_properties),
         ID_CTX_OPEN_FOLDER => ui_action("Open package folder", false, open_package_folder),
         ID_CTX_COPY_PATH => ui_action("Copy package folder path", false, copy_package_folder_path),
+        ID_CTX_COPY_CELL => ui_action("Copy cell text", false, copy_cell_text),
+        ID_CTX_COPY_ROWS => ui_action("Copy selected rows", false, copy_selected_rows),
+        ID_FOCUS_FILTER => ui::focus_filter(),
         _ => {}
     }
 }
@@ -310,6 +327,7 @@ pub fn update_view() {
             &ui::filter_text(),
             ui::menu_checked(ID_OLD_ONLY),
             ui::menu_checked(ID_DISCONNECTED_ONLY),
+            ui::menu_checked(ID_PROBLEM_ONLY),
             SORT_COLUMN.with(|c| c.get()),
             SORT_DESCENDING.with(|s| s.get()),
         );
@@ -680,6 +698,28 @@ fn copy_package_folder_path() -> Result<()> {
     win::set_clipboard_text(ui::form(), &package.folder)
 }
 
+/// Right-click > Copy cell text: the text of the cell that was clicked, exactly as the list shows it.
+fn copy_cell_text() -> Result<()> {
+    let Some((row, column)) = ui::context_cell() else { return Ok(()) };
+    let driver = VIEW.with(|v| v.borrow().rows.get(row).map(|r| r.driver));
+    let texts = driver.and_then(|index| DRIVERS.with(|d| d.borrow().get(index).map(row_texts)));
+    match texts.as_ref().and_then(|t| t.get(column)) {
+        Some(text) => win::set_clipboard_text(ui::form(), text),
+        None => Ok(()),
+    }
+}
+
+/// Right-click > Copy selected rows: the highlighted rows as tab-separated text, with the column titles.
+fn copy_selected_rows() -> Result<()> {
+    let selected = selected_packages();
+    if selected.is_empty() {
+        show_message("No rows are selected. Click a row (or several, with Ctrl or Shift) first.", Icon::Information);
+        return Ok(());
+    }
+    let rows: Vec<&Driver> = selected.iter().collect();
+    win::set_clipboard_text(ui::form(), &export::tsv_text(&rows))
+}
+
 /// Options > Include boot-critical packages in the automatic selections: says what the option does right now.
 fn show_boot_critical_effect() {
     let state = if ui::menu_checked(ID_OPT_INCLUDE_BOOT) { "included in" } else { "excluded from" };
@@ -936,16 +976,14 @@ fn export_packages(packages: Vec<Driver>, nothing_message: &str) -> Result<()> {
 
 // ---- Drivers > Restore backup... -------------------------------------------------------------------------
 
-/// Restores the packages of a backup (or export) folder that has a manifest: every file is checked against
-/// the SHA-256 recorded when the backup was made, and only packages that are intact are added back to the
-/// Driver Store and installed on the devices they match.
-fn restore_backup() -> Result<()> {
+/// Asks for a backup or export folder and reads its manifest. None = cancelled, or a message already said why.
+fn pick_backup(action: &str) -> Option<(PathBuf, Vec<ManifestPackage>)> {
     let Some(folder) = win::browse_for_folder(
         ui::form(),
         "Select a backup folder made by this program: a folder with a manifest.txt inside, one per removal in the backup folder, or an export folder.",
     ) else {
-        applog::info("Restore backup was cancelled by the user (folder dialog).");
-        return Ok(());
+        applog::info(&format!("{action} was cancelled by the user (folder dialog)."));
+        return None;
     };
     let folder_text = path_text(&folder);
 
@@ -954,16 +992,65 @@ fn restore_backup() -> Result<()> {
             &format!("There is no {} in:\n{folder_text}\n\nOnly backups and exports made by this version have one. To add packages from any other folder, use Drivers > Add driver package...", backup::MANIFEST_NAME),
             Icon::Information,
         );
-        return Ok(());
+        return None;
     }
-    let packages = match backup::read_manifest(&folder) {
-        Ok(packages) => packages,
+    match backup::read_manifest(&folder) {
+        Ok(packages) => Some((folder, packages)),
         Err(error) => {
             applog::error(&format!("The manifest in {folder_text} is not valid: {error}"));
-            show_message(&format!("The manifest in:\n{folder_text}\nis not valid, so nothing was restored:\n{error}"), Icon::Warning);
-            return Ok(());
+            show_message(&format!("The manifest in:\n{folder_text}\nis not valid:\n{error}\n\nNothing was changed."), Icon::Warning);
+            None
         }
-    };
+    }
+}
+
+/// Checks every file of each package against the SHA-256 recorded in the manifest. Returns the packages that
+/// are intact and a "name: problem" line for each one that is not. The caller shows the progress bar.
+fn verify_packages<'a>(folder: &Path, packages: &'a [ManifestPackage]) -> (Vec<&'a ManifestPackage>, Vec<String>) {
+    let mut intact = Vec::new();
+    let mut damaged = Vec::new();
+    for package in packages {
+        ui::set_status_text(&format!("Checking {} ({})...", package.published_name, package.inf));
+        match backup::verify_package(folder, package) {
+            Ok(()) => {
+                applog::info(&format!("Backup of {} is intact (every file matches its SHA-256).", package.published_name));
+                intact.push(package);
+            }
+            Err(problem) => {
+                applog::error(&format!("Backup of {} is NOT intact: {problem}", package.published_name));
+                damaged.push(format!("{}: {problem}", package.published_name));
+            }
+        }
+        ui::step_progress();
+    }
+    (intact, damaged)
+}
+
+/// Drivers > Verify backup...: the check that Restore does first, without restoring anything.
+fn verify_backup() -> Result<()> {
+    let Some((folder, packages)) = pick_backup("Verify backup") else { return Ok(()) };
+    applog::info(&format!("Verifying {} package(s) of {}.", packages.len(), path_text(&folder)));
+    ui::set_busy(true);
+    ui::show_progress(packages.len());
+    let (intact, damaged) = verify_packages(&folder, &packages);
+    ui::hide_progress();
+    ui::set_busy(false);
+
+    let mut summary = format!("{} of {} package(s) are intact (every file matches its SHA-256).", intact.len(), packages.len());
+    if !damaged.is_empty() {
+        summary.push_str(&format!("\n\nNot intact:\n{}", damaged.join("\n")));
+    }
+    applog::info(&format!("Verify finished: {} intact, {} not intact.", intact.len(), damaged.len()));
+    show_message(&summary, if damaged.is_empty() { Icon::Information } else { Icon::Warning });
+    Ok(())
+}
+
+/// Restores the packages of a backup (or export) folder that has a manifest: every file is checked against
+/// the SHA-256 recorded when the backup was made, and only packages that are intact are added back to the
+/// Driver Store and installed on the devices they match.
+fn restore_backup() -> Result<()> {
+    let Some((folder, packages)) = pick_backup("Restore backup") else { return Ok(()) };
+    let folder_text = path_text(&folder);
 
     let list: Vec<(String, String)> =
         packages.iter().map(|p| (p.published_name.clone(), format!("{} v{}, {} device(s) used it", p.inf, p.version, p.devices.len()))).collect();
@@ -987,22 +1074,7 @@ fn restore_backup() -> Result<()> {
     applog::info(&format!("Restoring {} package(s) from {folder_text}.", packages.len()));
     ui::set_busy(true);
     ui::show_progress(packages.len() * 2);
-    let mut intact: Vec<&ManifestPackage> = Vec::new();
-    let mut damaged: Vec<String> = Vec::new();
-    for package in &packages {
-        ui::set_status_text(&format!("Checking {} ({})...", package.published_name, package.inf));
-        match backup::verify_package(&folder, package) {
-            Ok(()) => {
-                applog::info(&format!("Backup of {} is intact (every file matches its SHA-256).", package.published_name));
-                intact.push(package);
-            }
-            Err(problem) => {
-                applog::error(&format!("Backup of {} is NOT intact and is skipped: {problem}", package.published_name));
-                damaged.push(format!("{}: {problem}", package.published_name));
-            }
-        }
-        ui::step_progress();
-    }
+    let (intact, damaged) = verify_packages(&folder, &packages);
 
     let (mut added, mut failed, mut reboot) = (0usize, 0usize, false);
     let target = image();
@@ -1413,7 +1485,7 @@ fn show_how_it_works() {
         "Date and version disagree about which package of the same driver is newer (for example a higher version with an older date). The program cannot tell which one Windows prefers, so it never selects these automatically; you decide.".into(),
         "".into(),
         "IN USE".into(),
-        "At least one device is bound to the package, directly or through an extension INF. The Devices column lists them; \"not connected\" means the device is not plugged in right now.".into(),
+        "At least one device is bound to the package, directly or through an extension INF. The Devices column lists them; \"not connected\" means the device is not plugged in right now, and \"problem code NN\" is the code Device Manager shows for a plugged-in device that has a problem (View > Show only packages used by devices with a problem lists those packages).".into(),
         "".into(),
         "COLORS (never the only signal)".into(),
         "Light blue = old and unused. Light yellow = old but in use. Light gray = review. No color = latest. The \"In use\" and \"Status\" columns say the same in text.".into(),
@@ -1435,7 +1507,7 @@ fn show_how_it_works() {
         "".into(),
         "BACKUPS, EXPORTS, LOGS AND SETTINGS".into(),
         format!("Backups: {}\\<time of removal>", path_text(applog::backup_root())),
-        "Every backup and export folder has a manifest.txt (the devices that used each package and the SHA-256 of every file). Drivers > Restore backup... checks each file against it and installs only the packages that are intact.".into(),
+        "Every backup and export folder has a manifest.txt (the devices that used each package and the SHA-256 of every file). Drivers > Restore backup... checks each file against it and installs only the packages that are intact; Drivers > Verify backup... does the same check without restoring anything.".into(),
         format!("Exports: <folder you choose>\\{APP_FILE_NAME}_export_<time of export>"),
         format!("Log of this run: {}", path_text(applog::log_file())),
         format!("Settings: {}", path_text(&settings_file())),

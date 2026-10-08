@@ -383,13 +383,15 @@ mod imp {
                 .filter(|n| !n.is_empty())
                 .or_else(|| device_property(devinst, &DEVPKEY_Device_DeviceDesc).map(|b| parse_sz(&b)))
                 .unwrap_or_default();
-            // A device that is not plugged in has no live device node: the status call says so.
-            let present = unsafe {
+            // A device that is not plugged in has no live device node: the status call says so. For one that
+            // is plugged in, the same call gives its Device Manager problem code (0 = no problem).
+            let (present, problem) = unsafe {
                 let mut status = CM_DEVNODE_STATUS_FLAGS(0);
                 let mut problem = CM_PROB(0);
-                CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) == CR_SUCCESS
+                let present = CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) == CR_SUCCESS;
+                (present, if present { problem.0 } else { 0 })
             };
-            devices.push(DeviceRecord { instance_id, name, inf, extended_infs, present });
+            devices.push(DeviceRecord { instance_id, name, inf, extended_infs, present, problem });
             proc::pump_throttled();
         }
         Ok(devices)

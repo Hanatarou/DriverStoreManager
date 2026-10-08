@@ -16,7 +16,7 @@ use crate::netversion::NetVersion;
 pub const APP_NAME: &str = "DriverStore Manager";
 /// Name used in file and folder names (no space): DriverStoreManager_<time>.log, DriverStoreManager.ini ...
 pub const APP_FILE_NAME: &str = "DriverStoreManager";
-pub const APP_VERSION: &str = "1.1.0.0";
+pub const APP_VERSION: &str = "1.2.0.0";
 
 /// The note about AI shown in Help > About (the README text, except "under MIT license").
 pub const AI_NOTICE: &str = "I built this project alone, as a personal project, with substantial help from AI tools — mainly Claude, and also DeepSeek and Qwen. I believe knowledge only survives past us if it's shared, and that's the spirit behind releasing this for free.\n\nI did this on my own time and dime, covering all costs myself, without asking anyone for donations.\n\nJust as I respect opinions against the use of AI, I expect the use of AI here — as a tool that helped me build this project — to be respected in return. Disrespect toward this work, toward me, or toward anyone else involved will not be tolerated.\n\nAll AI-generated content is reviewed and validated by me before being committed — I stand behind every decision to include code in this repository, regardless of how it was originally written. This project is still provided as-is, under MIT license, with no warranty of any kind.\n\nIf you're uncomfortable with AI-assisted code for any reason, you are under no obligation to use, contribute to, or engage with this project. No hard feelings — just move on.\n\nFor everyone else: bug reports and PRs are evaluated on their merits (does it work, is it correct), not on how the code was produced.";
@@ -210,6 +210,8 @@ pub struct Driver {
     pub in_use: bool,
     /// In use, but only by devices that are not plugged in right now.
     pub only_disconnected: bool,
+    /// At least one device bound to the package has a problem code (Device Manager shows it as "Code NN").
+    pub has_problem_device: bool,
     pub usage_text: String,
     pub in_use_text: String,
     pub device_text: String,
@@ -241,6 +243,8 @@ pub struct DeviceRecord {
     pub extended_infs: Vec<String>,
     /// False when the device is not plugged in right now.
     pub present: bool,
+    /// The Device Manager problem code of a device that is plugged in; 0 = no problem.
+    pub problem: u32,
 }
 
 /// A device bound to a package: the text shown for it and its instance ID.
@@ -249,6 +253,7 @@ pub struct DeviceRef {
     pub name: String,
     pub instance_id: String,
     pub present: bool,
+    pub problem: u32,
 }
 
 /// Maps each published package name ("oem16.inf", lower case) to the devices bound to it. A device counts for
@@ -261,7 +266,10 @@ pub fn new_device_map(devices: &[DeviceRecord]) -> HashMap<String, Vec<DeviceRef
         if !device.present {
             name.push_str(" (not connected)");
         }
-        let reference = DeviceRef { name, instance_id: device.instance_id.clone(), present: device.present };
+        if device.problem != 0 {
+            name.push_str(&format!(" (problem code {})", device.problem));
+        }
+        let reference = DeviceRef { name, instance_id: device.instance_id.clone(), present: device.present, problem: device.problem };
         let mut infs: Vec<String> = Vec::new();
         for inf in std::iter::once(&device.inf).chain(device.extended_infs.iter()) {
             let key = inf.to_lowercase();
@@ -411,6 +419,7 @@ fn build_records(raw: &[RawPackage], device_map: &HashMap<String, Vec<DeviceRef>
             let is_old = !newer.is_empty() || is_duplicate;
             let in_use = !devices.is_empty();
             let only_disconnected = in_use && devices.iter().all(|d| !d.present);
+            let has_problem_device = devices.iter().any(|d| d.problem != 0);
 
             let (status, status_text) = if !newer.is_empty() {
                 (
@@ -460,6 +469,7 @@ fn build_records(raw: &[RawPackage], device_map: &HashMap<String, Vec<DeviceRef>
                 usage_known,
                 in_use,
                 only_disconnected,
+                has_problem_device,
                 usage_text: if !usage_known { "Unknown" } else if in_use { "In use" } else { "Unused" }.to_string(),
                 in_use_text: if !usage_known {
                     "Unknown".to_string()
@@ -591,6 +601,7 @@ pub fn visible_packages(
     filter_text: &str,
     old_only: bool,
     disconnected_only: bool,
+    problem_only: bool,
     sort_column: usize,
     sort_descending: bool,
 ) -> Vec<usize> {
@@ -604,6 +615,9 @@ pub fn visible_packages(
     }
     if disconnected_only {
         indexes.retain(|&i| drivers[i].only_disconnected);
+    }
+    if problem_only {
+        indexes.retain(|&i| drivers[i].has_problem_device);
     }
     let sort_by = COLUMN_DEFINITIONS[sort_column].sort_by;
     // Sort-Object -Property @{Expression = $sortBy; Descending = ...}, @{Expression = 'Number'}
@@ -798,6 +812,7 @@ mod tests {
             inf: inf.into(),
             extended_infs: extended.iter().map(|s| s.to_string()).collect(),
             present,
+            problem: 0,
         }
     }
 
@@ -938,8 +953,8 @@ mod tests {
         assert_eq!(texts[17], drivers[0].folder);
         assert_eq!(COLUMN_DEFINITIONS[17].title, "Driver path");
         // Sorted by path: a.inf_x comes before b.inf_x. Found by a part of the path.
-        assert_eq!(visible_packages(&drivers, "", false, false, 17, false), vec![1, 0]);
-        assert_eq!(visible_packages(&drivers, "a.inf_x", false, false, 0, false), vec![1]);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 17, false), vec![1, 0]);
+        assert_eq!(visible_packages(&drivers, "a.inf_x", false, false, false, 0, false), vec![1]);
     }
 
     #[test]
@@ -973,14 +988,35 @@ mod tests {
         assert!(drivers[0].only_disconnected); // every device that uses it is unplugged
         assert!(!drivers[1].only_disconnected); // no device at all: unused, not "only disconnected"
         assert!(!drivers[2].only_disconnected); // one device is plugged in
-        assert_eq!(visible_packages(&drivers, "", false, true, 0, false), vec![0]);
-        assert_eq!(visible_packages(&drivers, "", false, false, 0, false), vec![0, 1, 2, 3]);
+        assert_eq!(visible_packages(&drivers, "", false, true, false, 0, false), vec![0]);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 0, false), vec![0, 1, 2, 3]);
 
         // The Signature column: the class name, sort (least trusted first), search.
         assert_eq!(row_texts(&drivers[1])[7], "Unsigned");
         assert_eq!(COLUMN_DEFINITIONS[7].title, "Signature");
-        assert_eq!(visible_packages(&drivers, "", false, false, 7, false), vec![1, 2, 0, 3]);
-        assert_eq!(visible_packages(&drivers, "unsigned", false, false, 0, false), vec![1]);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 7, false), vec![1, 2, 0, 3]);
+        assert_eq!(visible_packages(&drivers, "unsigned", false, false, false, 0, false), vec![1]);
+    }
+
+    #[test]
+    fn problem_devices_filter() {
+        let packages = vec![
+            raw("oem1.inf", "a.inf", "1.0.0.0", (2020, 1, 1)),
+            raw("oem2.inf", "b.inf", "1.0.0.0", (2020, 1, 1)),
+            raw("oem3.inf", "c.inf", "1.0.0.0", (2020, 1, 1)),
+        ];
+        let mut broken = device("Broken", "oem1.inf", &[], true, "USB\\BAD");
+        broken.problem = 28;
+        let fine = device("Fine", "oem2.inf", &[], true, "USB\\OK");
+        let drivers = new_driver_records(&packages, &map_of(&[broken, fine]));
+        assert!(drivers[0].has_problem_device);
+        assert!(!drivers[1].has_problem_device); // its device works
+        assert!(!drivers[2].has_problem_device); // no device at all
+        assert_eq!(drivers[0].device_text, "Broken (problem code 28)");
+        assert_eq!(visible_packages(&drivers, "", false, false, true, 0, false), vec![0]);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 0, false), vec![0, 1, 2]);
+        // An offline image has no devices: nothing has a problem.
+        assert!(new_offline_driver_records(&packages).iter().all(|d| !d.has_problem_device));
     }
 
     #[test]
@@ -995,7 +1031,7 @@ mod tests {
         let online = new_driver_records(&packages, &devices);
         assert_eq!(row_texts(&online[0])[14], "PCI\\A");
         assert_eq!(COLUMN_DEFINITIONS[14].title, "Device ID");
-        assert_eq!(visible_packages(&online, "pci\\a", false, false, 0, false), vec![0]);
+        assert_eq!(visible_packages(&online, "pci\\a", false, false, false, 0, false), vec![0]);
         assert!(online.iter().all(|d| d.usage_known));
 
         // Offline: usage is unknown, nothing counts as in use, the old/latest rules still work.
@@ -1043,15 +1079,15 @@ mod tests {
         assert_eq!(row_texts(&drivers[2])[16], "-"); // no files
 
         // Sorting: install date (none first), file count, signer, extension ID.
-        assert_eq!(visible_packages(&drivers, "", false, false, 6, false), vec![2, 1, 0]);
-        assert_eq!(visible_packages(&drivers, "", false, false, 16, true), vec![1, 0, 2]);
-        assert_eq!(visible_packages(&drivers, "", false, false, 8, false)[0], 1);
-        assert_eq!(visible_packages(&drivers, "", false, false, 9, true)[0], 0);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 6, false), vec![2, 1, 0]);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 16, true), vec![1, 0, 2]);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 8, false)[0], 1);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 9, true)[0], 0);
         // Searching: signer, extension ID, install date and a file name that is shown.
-        assert_eq!(visible_packages(&drivers, "acme", false, false, 0, false), vec![1]);
-        assert_eq!(visible_packages(&drivers, "abcdef12", false, false, 0, false), vec![0]);
-        assert_eq!(visible_packages(&drivers, "2024-03-05", false, false, 0, false), vec![0]);
-        assert_eq!(visible_packages(&drivers, "a.cat", false, false, 0, false), vec![0]);
+        assert_eq!(visible_packages(&drivers, "acme", false, false, false, 0, false), vec![1]);
+        assert_eq!(visible_packages(&drivers, "abcdef12", false, false, false, 0, false), vec![0]);
+        assert_eq!(visible_packages(&drivers, "2024-03-05", false, false, false, 0, false), vec![0]);
+        assert_eq!(visible_packages(&drivers, "a.cat", false, false, false, 0, false), vec![0]);
     }
 
     #[test]
@@ -1081,17 +1117,17 @@ mod tests {
         let drivers = new_driver_records(&packages, &HashMap::new());
 
         // Default sort: by number (numeric, so oem2 < oem3 < oem10).
-        let v = visible_packages(&drivers, "", false, false, 0, false);
+        let v = visible_packages(&drivers, "", false, false, false, 0, false);
         assert_eq!(v, vec![1, 2, 0]);
-        let v = visible_packages(&drivers, "", false, false, 0, true);
+        let v = visible_packages(&drivers, "", false, false, false, 0, true);
         assert_eq!(v, vec![0, 2, 1]);
         // Filter (case-insensitive, trimmed) and old only.
-        assert_eq!(visible_packages(&drivers, "  DISPLAY ", false, false, 0, false), vec![2]);
-        assert_eq!(visible_packages(&drivers, "", true, false, 0, false), vec![0]);
+        assert_eq!(visible_packages(&drivers, "  DISPLAY ", false, false, false, 0, false), vec![2]);
+        assert_eq!(visible_packages(&drivers, "", true, false, false, 0, false), vec![0]);
         // Sort by original INF, ties broken by number.
-        assert_eq!(visible_packages(&drivers, "", false, false, 1, false), vec![1, 0, 2]);
+        assert_eq!(visible_packages(&drivers, "", false, false, false, 1, false), vec![1, 0, 2]);
 
-        let visible = visible_packages(&drivers, "", false, false, 0, false);
+        let visible = visible_packages(&drivers, "", false, false, false, 0, false);
         let model = build_view(&drivers, &visible, Some(GroupBy::Class));
         assert_eq!(model.group_headers.len(), 2);
         assert_eq!(model.group_headers[0], "Display  -  1 package(s), 0 old, 1,000 B");

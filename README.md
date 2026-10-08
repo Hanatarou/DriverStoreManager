@@ -43,7 +43,7 @@ Every item below is something the program does; the classification, selection, d
 
 ### Safety first
 - 🛡️ **Verified backup before every removal:** every file of the copy must have the same name, size and **SHA-256** as the original (a size check alone misses a damaged copy). If the copy is not identical, that package is **not** removed.
-- ♻️ **Restore backup:** every backup and export folder gets a `manifest.txt` (the devices that used each package and the SHA-256 of every file). **Drivers > Restore backup…** checks each file against it and installs only the packages that are intact.
+- ♻️ **Restore backup:** every backup and export folder gets a `manifest.txt` (the devices that used each package and the SHA-256 of every file). **Drivers > Restore backup…** checks each file against it and installs only the packages that are intact. **Drivers > Verify backup…** does the same check without restoring anything.
 - 🔁 **Stale-list protection:** Windows reuses `oemNN` numbers, so just before removing, the checked packages are compared with the live Driver Store (INF name, version, date). If anything changed, **nothing** is removed and the list refreshes.
 - ✅ **Post-removal check:** the store is read again, and a package that `pnputil` reported as removed but is still there is reported as a failure.
 - ❓ **Confirmation defaults to No,** with specific warnings: still in use, not old, unused but latest, boot-critical.
@@ -68,6 +68,7 @@ Every item below is something the program does; the classification, selection, d
 - 🔏 **Signature** (the class Windows gives it: Logo Premium, Logo Standard, WHQL, Inbox, Unclassified, Authenticode, Unsigned…), **Signer**, **Install date (UTC)**, **Extension ID**, **Driver files** (the count and the first five names), **Device ID** and **Driver path** columns, all sortable and searchable.
 - 💬 Hover a cell that is cut off to see all of its text.
 - 🔌 **View > Show only packages used only by disconnected devices:** drivers whose hardware is not plugged in, good candidates for cleanup.
+- ⚠️ **View > Show only packages used by devices with a problem:** packages bound to a plugged-in device that Device Manager reports with a problem code (shown as `problem code NN` in the *Devices* column).
 
 ## 🔍 What it does *not* do (yet)
 
@@ -100,13 +101,13 @@ The program keeps these next to the `.exe`:
 ### Menus
 
 - **File:** Refresh (`F5`), Export list (`Ctrl+E`), Open offline Windows image, Return to the running Windows, open log and backup folders.
-- **Drivers:** Add driver package (`Ctrl+N`), Add and install (`Ctrl+Shift+N`), Export checked/all, Restore backup, Remove checked.
+- **Drivers:** Add driver package (`Ctrl+N`), Add and install (`Ctrl+Shift+N`), Export checked/all, Restore backup, Verify backup, Remove checked.
 - **Select:**
   - *Check old packages (unused only - safe)* — the recommended starting point.
   - *Check old packages (including in use)*, *Check unused packages* (any age), check/uncheck shown, invert, uncheck all.
-- **View:** Group by (class, provider, INF, usage, status), Show only old packages, Show only packages used only by disconnected devices.
+- **View:** Group by (class, provider, INF, usage, status), Show only old packages, Show only packages used only by disconnected devices, Show only packages used by devices with a problem, Go to the filter box (`Ctrl+F`).
 - **Options:** Back up before removing (on by default), include boot-critical packages in automatic selections (off).
-- **Right-click on a row:** check/uncheck a group, remove or export the selected rows, open device properties, open the package folder, copy its path.
+- **Right-click on a row:** check/uncheck a group, remove or export the selected rows, open device properties, open the package folder, copy its path, copy the text of the clicked cell, copy the selected rows (tab-separated, with the column titles).
 
 ### Row colors (never the only signal — the *In use* and *Status* columns say the same in text)
 

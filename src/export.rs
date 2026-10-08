@@ -13,6 +13,18 @@ fn csv_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// Tab-separated text for the clipboard: the column titles, then one line per row, with the same cell text
+/// as the window. Pastes into Excel or a text file as it is.
+pub fn tsv_text(rows: &[&Driver]) -> String {
+    let mut text = COLUMN_DEFINITIONS.iter().map(|c| c.title).collect::<Vec<_>>().join("\t");
+    text.push_str("\r\n");
+    for p in rows {
+        text.push_str(&row_texts(p).join("\t"));
+        text.push_str("\r\n");
+    }
+    text
+}
+
 pub fn csv_bytes(rows: &[&Driver], separator: &str) -> Vec<u8> {
     let mut text = String::new();
     text.push_str(&COLUMN_DEFINITIONS.iter().map(|c| csv_quote(c.title)).collect::<Vec<_>>().join(separator));
@@ -99,6 +111,7 @@ mod tests {
             usage_known: true,
             in_use: false,
             only_disconnected: false,
+            has_problem_device: false,
             usage_text: "Unused".into(),
             in_use_text: "No".into(),
             device_text: "-".into(),
@@ -121,6 +134,19 @@ mod tests {
         assert_eq!(lines.next().unwrap(), "");
         assert!(text.contains("\"Install date (UTC)\";"));
         assert!(text.contains("\"Device ID\";"));
+    }
+
+    #[test]
+    fn tsv_is_the_window() {
+        let d = sample();
+        let text = tsv_text(&[&d, &d]);
+        let mut lines = text.split("\r\n");
+        let titles: Vec<&str> = COLUMN_DEFINITIONS.iter().map(|c| c.title).collect();
+        assert_eq!(lines.next().unwrap(), titles.join("\t"));
+        let cells = row_texts(&d).join("\t");
+        assert_eq!(lines.next().unwrap(), cells);
+        assert_eq!(lines.next().unwrap(), cells);
+        assert_eq!(lines.next().unwrap(), "");
     }
 
     #[test]

@@ -360,6 +360,7 @@ mod tests {
             size_exact: true,
             files: Vec::new(),
             only_disconnected: false,
+            has_problem_device: false,
             usage_known: true,
             is_old: false,
             status: crate::model::Status::Latest,

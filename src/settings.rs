@@ -32,6 +32,8 @@ pub struct Settings {
     pub old_only: bool,
     /// View > Show only packages used only by disconnected devices
     pub disconnected_only: bool,
+    /// View > Show only packages used by devices with a problem
+    pub problem_only: bool,
     /// Index into GROUP_MODES
     pub group_mode: usize,
     /// Index into COLUMN_DEFINITIONS
@@ -49,6 +51,7 @@ impl Default for Settings {
             include_boot_critical: false,
             old_only: false,
             disconnected_only: false,
+            problem_only: false,
             group_mode: DEFAULT_GROUP_MODE,
             sort_column: 0,
             sort_descending: false,
@@ -99,6 +102,7 @@ pub fn parse(text: &str, group_modes: usize, columns: usize) -> Settings {
             "IncludeBootCritical" => settings.include_boot_critical = parse_bool(value).unwrap_or(false),
             "ShowOnlyOld" => settings.old_only = parse_bool(value).unwrap_or(false),
             "ShowOnlyDisconnected" => settings.disconnected_only = parse_bool(value).unwrap_or(false),
+            "ShowOnlyProblems" => settings.problem_only = parse_bool(value).unwrap_or(false),
             "GroupBy" => settings.group_mode = parse_index(value, group_modes).unwrap_or(DEFAULT_GROUP_MODE),
             "SortColumn" => settings.sort_column = parse_index(value, columns).unwrap_or(0),
             "SortDescending" => settings.sort_descending = parse_bool(value).unwrap_or(false),
@@ -129,6 +133,7 @@ pub fn to_text(settings: &Settings) -> String {
     text.push_str(&format!("IncludeBootCritical={}\r\n", flag(settings.include_boot_critical)));
     text.push_str(&format!("ShowOnlyOld={}\r\n", flag(settings.old_only)));
     text.push_str(&format!("ShowOnlyDisconnected={}\r\n", flag(settings.disconnected_only)));
+    text.push_str(&format!("ShowOnlyProblems={}\r\n", flag(settings.problem_only)));
     text.push_str(&format!("GroupBy={}\r\n", settings.group_mode));
     text.push_str(&format!("SortColumn={}\r\n", settings.sort_column));
     text.push_str(&format!("SortDescending={}\r\n", flag(settings.sort_descending)));
@@ -207,6 +212,7 @@ mod tests {
             include_boot_critical: true,
             old_only: true,
             disconnected_only: true,
+            problem_only: true,
             group_mode: 3,
             sort_column: 6,
             sort_descending: true,
@@ -221,7 +227,7 @@ mod tests {
 
     #[test]
     fn bad_values_fall_back_to_defaults() {
-        let text = "BackUpBeforeRemoving=maybe\nGroupBy=99\nSortColumn=-1\nShowOnlyOld=2\nShowOnlyDisconnected=x\nWindowLeft=1\nWindowTop=1\nWindowWidth=5\nWindowHeight=700\nnonsense\nUnknown=1\n";
+        let text = "BackUpBeforeRemoving=maybe\nGroupBy=99\nSortColumn=-1\nShowOnlyOld=2\nShowOnlyDisconnected=x\nShowOnlyProblems=2\nWindowLeft=1\nWindowTop=1\nWindowWidth=5\nWindowHeight=700\nnonsense\nUnknown=1\n";
         let settings = parse(text, 6, 18);
         assert_eq!(settings, Settings::default());
         // The safe default: backups stay on unless the file clearly says 0.
