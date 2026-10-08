@@ -1,0 +1,6 @@
+/target
+*.pdb
+*.rs.bk
+log/
+backup/
+DriverStoreManager.ini
