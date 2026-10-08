@@ -1,4 +1,4 @@
-//! File-system helpers: folder sizes for the list, the extension ID of an INF, copying a driver package (backup and
+//! File-system helpers: folder sizes and file names for the list, copying a driver package (backup and
 //! export) and the count of .inf files used by "Add driver package...". Loops that can take long call
 //! `proc::pump_throttled` so the window keeps repainting.
 
@@ -8,22 +8,39 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
+use crate::culture::compare_ignore_case;
 use crate::format::{file_name_without_extension, safe_file_name};
 use crate::backup::{self, FileEntry};
 use crate::model::Driver;
 use crate::proc;
 
-/// Size of a folder for the list: whatever can be read is counted. Returns (bytes, complete). When something
-/// cannot be read (a file locked by another program, no permission) the size is a minimum and `complete`
-/// is false; the list shows it as "1.2 MB+" and the reason goes to the log through `problems`.
-pub fn folder_size_lenient(path: &Path, problems: &mut Vec<String>) -> (u64, bool) {
-    let mut total = 0u64;
-    let mut complete = true;
+/// What a package folder holds, for the list.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FolderScan {
+    pub bytes: u64,
+    /// False when something could not be read: `bytes` is then a minimum (and `files` may be missing some names).
+    pub complete: bool,
+    /// The names of the files, relative to the folder ("sub\b.sys"), sorted.
+    pub files: Vec<String>,
+}
+
+/// Size and file names of a folder for the list: whatever can be read is counted. When something cannot be
+/// read (a file locked by another program, no permission) the size is a minimum and `complete` is false; the
+/// list shows it as "1.2 MB+" and the reason goes to the log through `problems`.
+pub fn scan_folder(path: &Path, problems: &mut Vec<String>) -> FolderScan {
+    let mut scan = FolderScan { bytes: 0, complete: true, files: Vec::new() };
+    scan_into(path, "", problems, &mut scan);
+    scan.files.sort_by(|a, b| compare_ignore_case(a, b));
+    scan
+}
+
+fn scan_into(path: &Path, prefix: &str, problems: &mut Vec<String>, scan: &mut FolderScan) {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error) => {
             problems.push(format!("{}: {}", path.display(), clean_io(&error)));
-            return (0, false);
+            scan.complete = false;
+            return;
         }
     };
     for entry in entries {
@@ -31,31 +48,30 @@ pub fn folder_size_lenient(path: &Path, problems: &mut Vec<String>) -> (u64, boo
             Ok(entry) => entry,
             Err(error) => {
                 problems.push(format!("{}: {}", path.display(), clean_io(&error)));
-                complete = false;
+                scan.complete = false;
                 continue;
             }
         };
+        let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
         match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => {
-                let (size, ok) = folder_size_lenient(&entry.path(), problems);
-                total += size;
-                complete &= ok;
-            }
+            Ok(file_type) if file_type.is_dir() => scan_into(&entry.path(), &format!("{name}\\"), problems, scan),
             Ok(_) => match entry.metadata() {
-                Ok(meta) => total += meta.len(),
+                Ok(meta) => {
+                    scan.bytes += meta.len();
+                    scan.files.push(name);
+                }
                 Err(error) => {
                     problems.push(format!("{}: {}", entry.path().display(), clean_io(&error)));
-                    complete = false;
+                    scan.complete = false;
                 }
             },
             Err(error) => {
                 problems.push(format!("{}: {}", entry.path().display(), clean_io(&error)));
-                complete = false;
+                scan.complete = false;
             }
         }
         proc::pump_throttled();
     }
-    (total, complete)
 }
 
 /// True when two folder paths name the same folder: case-insensitive, trailing "\" or "/" ignored.
@@ -136,89 +152,6 @@ pub fn write_file_safely(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(anyhow!("Could not write '{}': {}", path.display(), clean_io(&error)));
     }
     Ok(())
-}
-
-/// Text of a file the way [System.IO.File]::ReadAllText reads it: UTF-8 / UTF-16 / UTF-32 byte order
-/// marks are honoured, everything else is UTF-8.
-pub fn decode_text(bytes: &[u8]) -> String {
-    let utf16 = |data: &[u8], little: bool| -> String {
-        let units: Vec<u16> = data
-            .chunks_exact(2)
-            .map(|c| if little { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
-            .collect();
-        String::from_utf16_lossy(&units)
-    };
-    let utf32 = |data: &[u8], little: bool| -> String {
-        data.chunks_exact(4)
-            .map(|c| {
-                let v = if little { u32::from_le_bytes([c[0], c[1], c[2], c[3]]) } else { u32::from_be_bytes([c[0], c[1], c[2], c[3]]) };
-                char::from_u32(v).unwrap_or('\u{FFFD}')
-            })
-            .collect()
-    };
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        String::from_utf8_lossy(&bytes[3..]).into_owned()
-    } else if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
-        utf32(&bytes[4..], true)
-    } else if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
-        utf32(&bytes[4..], false)
-    } else if bytes.starts_with(&[0xFF, 0xFE]) {
-        utf16(&bytes[2..], true)
-    } else if bytes.starts_with(&[0xFE, 0xFF]) {
-        utf16(&bytes[2..], false)
-    } else {
-        String::from_utf8_lossy(bytes).into_owned()
-    }
-}
-
-/// Extension INFs declare "ExtensionId = {guid}" in their [Version] section. Packages with different
-/// extension IDs are different drivers even when class, provider and INF name match (Get-InfExtensionId).
-pub fn extension_id_from_text(text: &str) -> String {
-    // Hand-written equivalent of the .NET pattern (?im)^\s*ExtensionId\s*=\s*(\{[0-9a-f\-]+\}):
-    // a match may start at the beginning of the text or right after any '\n'.
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let skip_ws = |mut i: usize| {
-        while i < n && chars[i].is_whitespace() {
-            i += 1;
-        }
-        i
-    };
-    let mut starts = vec![0usize];
-    starts.extend(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1));
-    'starts: for start in starts {
-        let mut i = skip_ws(start);
-        for expected in "extensionid".chars() {
-            if i >= n || !chars[i].eq_ignore_ascii_case(&expected) {
-                continue 'starts;
-            }
-            i += 1;
-        }
-        i = skip_ws(i);
-        if i >= n || chars[i] != '=' {
-            continue;
-        }
-        i = skip_ws(i + 1);
-        if i >= n || chars[i] != '{' {
-            continue;
-        }
-        let open = i;
-        i += 1;
-        let body = i;
-        while i < n && (chars[i].is_ascii_hexdigit() || chars[i] == '-') {
-            i += 1;
-        }
-        if i == body || i >= n || chars[i] != '}' {
-            continue;
-        }
-        return chars[open..=i].iter().collect::<String>().to_lowercase();
-    }
-    String::new()
-}
-
-pub fn inf_extension_id(inf_path: &Path) -> io::Result<String> {
-    let bytes = fs::read(inf_path)?;
-    Ok(extension_id_from_text(&decode_text(&bytes)))
 }
 
 fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
@@ -370,22 +303,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extension_id() {
-        let text = "[Version]\r\nSignature=\"$WINDOWS NT$\"\r\n  ExtensionId = {ABCDEF12-3456-7890-ABCD-EF1234567890}\r\n";
-        assert_eq!(extension_id_from_text(text), "{abcdef12-3456-7890-abcd-ef1234567890}");
-        assert_eq!(extension_id_from_text("[Version]\nClass=Net\n"), "");
-        assert_eq!(extension_id_from_text("; ExtensionId = {aa}\n"), "");
-    }
-
-    #[test]
-    fn decoding() {
-        assert_eq!(decode_text(b"\xEF\xBB\xBFabc"), "abc");
-        assert_eq!(decode_text(b"\xFF\xFEa\x00b\x00"), "ab");
-        assert_eq!(decode_text(b"\xFE\xFF\x00a\x00b"), "ab");
-        assert_eq!(decode_text(b"plain"), "plain");
-    }
-
-    #[test]
     fn tree_size_and_copy() {
         let base = std::env::temp_dir().join(format!("dc_test_{}", std::process::id()));
         let src = base.join("src");
@@ -395,11 +312,15 @@ mod tests {
         assert_eq!(count_inf_files(&src).unwrap(), 1);
         assert!(same_folder("C:\\", "c:") && same_folder("D:\\Img\\", "d:\\img") && !same_folder("C:\\", "D:\\"));
 
-        // Lenient size: a missing folder gives a partial result and a reason, not an error.
+        // Lenient scan: size and file names (sorted, with the sub folder); a missing folder gives a partial
+        // result and a reason, not an error.
         let mut problems = Vec::new();
-        assert_eq!(folder_size_lenient(&src, &mut problems), (15, true));
+        let scan = scan_folder(&src, &mut problems);
+        assert_eq!((scan.bytes, scan.complete), (15, true));
+        assert_eq!(scan.files, vec!["a.inf".to_string(), "sub\\b.sys".to_string()]);
         assert!(problems.is_empty());
-        assert_eq!(folder_size_lenient(&base.join("missing"), &mut problems), (0, false));
+        let missing = scan_folder(&base.join("missing"), &mut problems);
+        assert_eq!(missing, FolderScan { bytes: 0, complete: false, files: Vec::new() });
         assert_eq!(problems.len(), 1);
 
         // Safe folders and files.
@@ -432,9 +353,12 @@ mod tests {
             version: crate::netversion::NetVersion::parse("1.0.0.0").unwrap(),
             date: crate::date::Date::from_ymd_opt(2020, 1, 1).unwrap(),
             boot_critical: false,
-            signature: crate::model::Signature::Signed,
+            signature: crate::model::Signature(0x0D00_0005),
+            signer: String::new(),
+            install_date: None,
             size_bytes: 15,
             size_exact: true,
+            files: Vec::new(),
             only_disconnected: false,
             usage_known: true,
             is_old: false,
@@ -473,26 +397,5 @@ mod tests {
         let err = copy_driver_package(&package, &dest).unwrap_err().to_string();
         assert!(err.starts_with("The folder already exists, so nothing was copied: "));
         fs::remove_dir_all(&base).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod extension_id_tests {
-    use super::extension_id_from_text as ext;
-
-    #[test]
-    fn matches_the_old_regex_behaviour() {
-        assert_eq!(ext("[Version]\r\n ExtensionId = {ABCDEF12-3456-7890-ABCD-EF1234567890}\r\n"), "{abcdef12-3456-7890-abcd-ef1234567890}");
-        assert_eq!(ext("extensionid={aa}"), "{aa}");
-        assert_eq!(ext("EXTENSIONID\t=\t{A-b}"), "{a-b}");
-        assert_eq!(ext("ExtensionId =\r\n{aa}"), "{aa}"); // \s* spans the line break, like in .NET
-        assert_eq!(ext("; ExtensionId = {aa}"), "");
-        assert_eq!(ext("x ExtensionId = {aa}"), "");
-        assert_eq!(ext("ExtensionId = {}"), "");
-        assert_eq!(ext("ExtensionId = {zz}"), "");
-        assert_eq!(ext("ExtensionId = {aa"), "");
-        assert_eq!(ext("ExtensionId {aa}"), "");
-        assert_eq!(ext("A=1\nB=2\nExtensionId={f0}\n"), "{f0}");
-        assert_eq!(ext(""), "");
     }
 }

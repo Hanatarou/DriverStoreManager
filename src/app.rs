@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::applog;
 use crate::backup::{self, ManifestPackage};
+use crate::drvstore;
 use crate::export;
 use crate::format::{format_date, format_package_list, format_size, output_tail};
 use crate::fsops::{self, clean_io};
@@ -366,11 +367,9 @@ fn raw_packages(target: &ImageTarget, drivers: Vec<native::WindowsDriver>) -> Re
             }
         }
         let number = model::parse_package_number(&d.driver).map_err(|e| anyhow!("{e}"))?;
-        let extension_id = fsops::inf_extension_id(Path::new(&d.original_file_name))
-            .map_err(|e| anyhow!("Could not read '{}': {}", d.original_file_name, clean_io(&e)))?;
         // A folder that cannot be read completely does not stop the list: the size is shown as a minimum.
         let mut problems = Vec::new();
-        let (size_bytes, size_exact) = fsops::folder_size_lenient(Path::new(&d.folder), &mut problems);
+        let scan = fsops::scan_folder(Path::new(&d.folder), &mut problems);
         for problem in problems.iter().take(5) {
             applog::warn(&format!("{}: size is incomplete - {problem}", d.driver));
         }
@@ -379,15 +378,18 @@ fn raw_packages(target: &ImageTarget, drivers: Vec<native::WindowsDriver>) -> Re
             number,
             original_inf: d.original_inf,
             folder: d.folder,
-            extension_id,
+            extension_id: d.extension_id,
             provider: d.provider,
             class: d.class,
             version: d.version,
             date: d.date,
             boot_critical: d.boot_critical,
             signature: d.signature,
-            size_bytes,
-            size_exact,
+            signer: d.signer,
+            install_date: d.install_date,
+            size_bytes: scan.bytes,
+            size_exact: scan.complete,
+            files: scan.files,
         });
         proc::pump_throttled();
     }
@@ -401,10 +403,10 @@ pub fn update_inventory() -> Result<()> {
     ui::set_status_text("Reading driver packages (this can take a few seconds)...");
 
     applog::info(&format!(
-        "Reading driver packages of {} with the DISM API. Only third-party packages (oemNN.inf) are listed.",
+        "Reading driver packages of {} from the Driver Store (drvstore.dll). Only third-party packages (oemNN.inf) are listed.",
         target.describe()
     ));
-    let raw = raw_packages(&target, native::get_windows_drivers(&target)?)?;
+    let raw = raw_packages(&target, drvstore::get_windows_drivers(&target)?)?;
     applog::info(&format!("Found {} packages.", raw.len()));
 
     let drivers = if target.is_offline() {
@@ -469,7 +471,7 @@ fn open_offline_image() -> Result<()> {
             root = parent.to_path_buf();
         }
     }
-    // The Windows that is running is not an offline image: DISM refuses it.
+    // The Windows that is running is not an offline image.
     if let Some(running_root) = win::windows_directory().parent() {
         if fsops::same_folder(&path_text(running_root), &path_text(&root)) {
             show_message(
@@ -1167,7 +1169,7 @@ fn remove_driver_packages(target: &ImageTarget, packages: &[Driver], backup_dire
 /// Store entry is missing or is not the same package (INF name, version, date) as the one on screen.
 fn get_changed_packages(target: &ImageTarget, packages: &[Driver]) -> Result<Vec<String>> {
     let mut current: HashMap<String, String> = HashMap::new();
-    for entry in native::get_windows_drivers(target)? {
+    for entry in drvstore::get_windows_drivers(target)? {
         current.insert(entry.driver.to_lowercase(), format!("{}|{}|{}", entry.original_inf, entry.version, format_date(entry.date)));
     }
     let mut changed = Vec::new();
@@ -1402,7 +1404,7 @@ fn open_folder(path: &Path) -> Result<()> {
 fn show_how_it_works() {
     let lines: Vec<String> = vec![
         "WHAT YOU SEE".into(),
-        "Every third-party driver package (oemNN.inf) stored in the Windows Driver Store. \"Published name\" is the name Windows gave the package; \"Original INF\" is the vendor file name. A size ending in + means part of the package could not be read, so the real size is larger. \"Signature\" is Signed, Unsigned or Unknown, as DISM reports it; \"Driver path\" is the package folder in the Driver Store.".into(),
+        "Every third-party driver package (oemNN.inf) stored in the Windows Driver Store. \"Published name\" is the name Windows gave the package; \"Original INF\" is the vendor file name. A size ending in + means part of the package could not be read, so the real size is larger. \"Signature\" is the class Windows gives the signature (Logo Premium, Logo Standard, WHQL, Inbox, Unclassified, Authenticode, Unsigned...) and \"Signer\" who signed it; \"Install date (UTC)\" is when the package was added to the Driver Store, in UTC so it reads the same online and offline; \"Extension ID\" is set only for extension INFs; \"Driver files\" counts the files in the package folder and names the first five (the full list is the folder: right-click > Open package folder); \"Driver path\" is the package folder in the Driver Store.".into(),
         "".into(),
         "OLD".into(),
         "Either another package of the same driver (same class, provider, INF name and extension ID) has a newer date and a version that is not lower, or an identical package (same version and date) is kept instead: of identical packages one stays (the one a device uses, otherwise the lowest oemNN) and the others are duplicates.".into(),
@@ -1423,13 +1425,13 @@ fn show_how_it_works() {
         "For each package: pnputil /delete-driver oemNN.inf /uninstall. The driver is first uninstalled from the devices that use it (they switch to the best remaining driver), then the package is deleted. This also works for a package that is still in use; there is no force option because pnputil ignores /force together with /uninstall.".into(),
         "".into(),
         "OFFLINE IMAGES".into(),
-        "File > Open offline Windows image... manages the third-party drivers of a Windows on another disk (for example in Windows PE): list, remove, add, export and restore, all through the DISM API. Pick the root of the image, the drive or folder that contains the Windows folder. An offline image has no devices, so \"In use\" is Unknown, \"Check unused packages\" and \"Add and install\" are not available, and the backups go to a folder you choose (not the RAM disk X: of Windows PE). File > Return to the running Windows goes back.".into(),
+        "File > Open offline Windows image... manages the third-party drivers of a Windows on another disk (for example in Windows PE): the list comes from drvstore.dll; add, remove and restore go through the DISM API. Pick the root of the image, the drive or folder that contains the Windows folder. An offline image has no devices, so \"In use\" is Unknown, \"Check unused packages\" and \"Add and install\" are not available, and the backups go to a folder you choose (not the RAM disk X: of Windows PE). File > Return to the running Windows goes back.".into(),
         "".into(),
         "SAFETY".into(),
         "Every removal asks for confirmation (the default answer is No). Just before removing, the packages are compared with the Driver Store again; if anything changed, nothing is removed. Backups are verified, and a package whose backup failed is not removed. After removing, the Driver Store is read again to confirm the packages are really gone. The window cannot be closed while an operation runs. The log and backup folders are refused if they are links or junctions.".into(),
         "".into(),
         "HOW IT READS".into(),
-        "Packages come from the DISM API and devices from the Windows Configuration Manager; no PowerShell is started. Every change is made by pnputil.exe, and success is judged by its exit code, never by its text.".into(),
+        "Packages come from the Windows Driver Store library (drvstore.dll) and devices from the Windows Configuration Manager; no PowerShell is started. Every change is made by pnputil.exe, and success is judged by its exit code, never by its text.".into(),
         "".into(),
         "BACKUPS, EXPORTS, LOGS AND SETTINGS".into(),
         format!("Backups: {}\\<time of removal>", path_text(applog::backup_root())),
@@ -1446,7 +1448,7 @@ fn show_about() {
     ui::show_text_window(
         APP_NAME,
         &format!(
-            "{APP_NAME} {APP_VERSION}\n\nReviews, cleans up, backs up and installs driver packages in the Windows Driver Store.\nIt reads packages with the DISM API and devices with the Configuration Manager; every change is made by pnputil.exe.\n\nRequires Windows 10 version 1607 or later (64-bit) and administrator rights.\n\nINSPIRED BY\nDriver Store Explorer (RAPR) by lostindark and contributors (GPL-2.0):\nhttps://github.com/lostindark/DriverStoreExplorer\n\nA NOTE ON AI\n{}",
+            "{APP_NAME} {APP_VERSION}\n\nReviews, cleans up, backs up and installs driver packages in the Windows Driver Store.\nIt reads packages with the Driver Store library (drvstore.dll) and devices with the Configuration Manager; every change is made by pnputil.exe (DISM for an offline image).\n\nRequires Windows 10 version 1607 or later (64-bit) and administrator rights.\n\nINSPIRED BY\nDriver Store Explorer (RAPR) by lostindark and contributors (GPL-2.0):\nhttps://github.com/lostindark/DriverStoreExplorer\n\nA NOTE ON AI\n{}",
             model::AI_NOTICE
         ),
     );

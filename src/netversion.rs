@@ -15,7 +15,7 @@ pub struct NetVersion {
 
 impl NetVersion {
     /// Like `new Version(string)`: 2 to 4 non-negative Int32 components separated by dots (tests only: the
-    /// program gets the four numbers from DISM directly).
+    /// program gets the four numbers from the Driver Store directly).
     #[cfg(test)]
     pub fn parse(text: &str) -> Result<NetVersion, String> {
         let fail = || {

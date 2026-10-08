@@ -4,10 +4,10 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::date::Date;
+use crate::date::{Date, DateTime};
 
 use crate::culture::compare_ignore_case;
-use crate::format::{contains_ordinal_ignore_case, format_date, format_size};
+use crate::format::{contains_ordinal_ignore_case, format_date, format_date_time, format_size};
 use crate::netversion::NetVersion;
 
 // ---- Constants (section 1) -------------------------------------------------------------------------
@@ -16,7 +16,7 @@ use crate::netversion::NetVersion;
 pub const APP_NAME: &str = "DriverStore Manager";
 /// Name used in file and folder names (no space): DriverStoreManager_<time>.log, DriverStoreManager.ini ...
 pub const APP_FILE_NAME: &str = "DriverStoreManager";
-pub const APP_VERSION: &str = "1.0.0.0";
+pub const APP_VERSION: &str = "1.1.0.0";
 
 /// The note about AI shown in Help > About (the README text, except "under MIT license").
 pub const AI_NOTICE: &str = "I built this project alone, as a personal project, with substantial help from AI tools — mainly Claude, and also DeepSeek and Qwen. I believe knowledge only survives past us if it's shared, and that's the spirit behind releasing this for free.\n\nI did this on my own time and dime, covering all costs myself, without asking anyone for donations.\n\nJust as I respect opinions against the use of AI, I expect the use of AI here — as a tool that helped me build this project — to be respected in return. Disrespect toward this work, toward me, or toward anyone else involved will not be tolerated.\n\nAll AI-generated content is reviewed and validated by me before being committed — I stand behind every decision to include code in this repository, regardless of how it was originally written. This project is still provided as-is, under MIT license, with no warranty of any kind.\n\nIf you're uncomfortable with AI-assisted code for any reason, you are under no obligation to use, contribute to, or engage with this project. No hard feelings — just move on.\n\nFor everyone else: bug reports and PRs are evaluated on their merits (does it work, is it correct), not on how the code was produced.";
@@ -46,13 +46,17 @@ pub enum SortBy {
     Class,
     Version,
     Date,
-    SizeBytes,
+    InstallDate,
+    Signature,
+    Signer,
+    ExtensionId,
     BootCritical,
     InUse,
+    Status,
     DeviceText,
     DeviceId,
-    Signature,
-    Status,
+    SizeBytes,
+    FileCount,
     Folder,
 }
 
@@ -62,20 +66,26 @@ pub struct ColumnDefinition {
     pub sort_by: SortBy,
 }
 
-pub const COLUMN_DEFINITIONS: [ColumnDefinition; 14] = [
+/// The columns, in the order they are shown: what the package is (name, INF, provider, class), which version
+/// and when, who signed it, whether it matters (boot, use, status), the devices, then what is on disk.
+pub const COLUMN_DEFINITIONS: [ColumnDefinition; 18] = [
     ColumnDefinition { title: "Published name", width: 110, sort_by: SortBy::Number },
     ColumnDefinition { title: "Original INF", width: 220, sort_by: SortBy::OriginalInf },
     ColumnDefinition { title: "Provider", width: 160, sort_by: SortBy::Provider },
     ColumnDefinition { title: "Class", width: 140, sort_by: SortBy::Class },
     ColumnDefinition { title: "Version", width: 110, sort_by: SortBy::Version },
     ColumnDefinition { title: "Date", width: 85, sort_by: SortBy::Date },
-    ColumnDefinition { title: "Size", width: 75, sort_by: SortBy::SizeBytes },
+    ColumnDefinition { title: "Install date (UTC)", width: 125, sort_by: SortBy::InstallDate },
+    ColumnDefinition { title: "Signature", width: 100, sort_by: SortBy::Signature },
+    ColumnDefinition { title: "Signer", width: 200, sort_by: SortBy::Signer },
+    ColumnDefinition { title: "Extension ID", width: 280, sort_by: SortBy::ExtensionId },
     ColumnDefinition { title: "Boot-critical", width: 90, sort_by: SortBy::BootCritical },
-    ColumnDefinition { title: "Signature", width: 80, sort_by: SortBy::Signature },
     ColumnDefinition { title: "In use", width: 70, sort_by: SortBy::InUse },
+    ColumnDefinition { title: "Status", width: 240, sort_by: SortBy::Status },
     ColumnDefinition { title: "Devices", width: 260, sort_by: SortBy::DeviceText },
     ColumnDefinition { title: "Device ID", width: 300, sort_by: SortBy::DeviceId },
-    ColumnDefinition { title: "Status", width: 240, sort_by: SortBy::Status },
+    ColumnDefinition { title: "Size", width: 75, sort_by: SortBy::SizeBytes },
+    ColumnDefinition { title: "Driver files", width: 420, sort_by: SortBy::FileCount },
     ColumnDefinition { title: "Driver path", width: 430, sort_by: SortBy::Folder },
 ];
 
@@ -104,42 +114,34 @@ pub const DEFAULT_GROUP_MODE: usize = 1;
 
 // ---- Records ---------------------------------------------------------------------------------------
 
-/// Signature state of a package as DISM reports it (DismDriverSignature: 0 unknown, 1 unsigned, 2 signed).
+/// How a package is signed: the "signer score" Windows stores for it (DEVPKEY_DriverPackage_SignerScore).
+/// Lower is more trusted; 0x80000000 is unsigned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Signature {
-    Signed,
-    Unsigned,
-    Unknown,
-}
+pub struct Signature(pub u32);
 
 impl Signature {
-    pub fn from_dism(value: i32) -> Signature {
-        match value {
-            2 => Signature::Signed,
-            1 => Signature::Unsigned,
-            _ => Signature::Unknown,
-        }
-    }
-
+    /// The class name Windows itself gives the score (the table in drvstore.dll, same in Windows 10 and 11).
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Signature::Signed => "Signed",
-            Signature::Unsigned => "Unsigned",
-            Signature::Unknown => "Unknown",
+        match self.0 {
+            0x0D00_0001 => "Logo Premium",
+            0x0D00_0002 => "Logo Standard",
+            0x0D00_0003 => "Inbox",
+            0x0D00_0004 => "Unclassified",
+            0x0D00_0005 => "WHQL",
+            0x0F00_0000 => "Authenticode",
+            0x8000_0000 => "Unsigned",
+            0xC000_0000 => "Win9X Suspect",
+            _ => "Unknown",
         }
     }
 
-    /// Sort order: unsigned first, because those are the ones worth looking at.
-    fn rank(&self) -> u8 {
-        match self {
-            Signature::Unsigned => 0,
-            Signature::Unknown => 1,
-            Signature::Signed => 2,
-        }
+    /// Sort order: the least trusted first (a higher score comes first), because those are the ones worth looking at.
+    fn rank(&self) -> u32 {
+        u32::MAX - self.0
     }
 }
 
-/// What DISM tells about one package (plus the INF extension ID and the folder size).
+/// What the Driver Store tells about one package (plus what is in its folder).
 #[derive(Clone, Debug)]
 pub struct RawPackage {
     pub published_name: String,
@@ -153,9 +155,15 @@ pub struct RawPackage {
     pub date: Date,
     pub boot_critical: bool,
     pub signature: Signature,
+    /// Who signed the package ("Microsoft Windows Hardware Compatibility Publisher"); empty when not signed.
+    pub signer: String,
+    /// When the package was added to the Driver Store (local time); None when Windows does not say.
+    pub install_date: Option<DateTime>,
     pub size_bytes: u64,
     /// False when some file or folder of the package could not be read: `size_bytes` is then a minimum.
     pub size_exact: bool,
+    /// The files in the package folder (names below it), sorted.
+    pub files: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,8 +197,11 @@ pub struct Driver {
     pub date: Date,
     pub boot_critical: bool,
     pub signature: Signature,
+    pub signer: String,
+    pub install_date: Option<DateTime>,
     pub size_bytes: u64,
     pub size_exact: bool,
+    pub files: Vec<String>,
     pub is_old: bool,
     pub status: Status,
     pub status_text: String,
@@ -438,8 +449,11 @@ fn build_records(raw: &[RawPackage], device_map: &HashMap<String, Vec<DeviceRef>
                 date: package.date,
                 boot_critical: package.boot_critical,
                 signature: package.signature,
+                signer: package.signer.clone(),
+                install_date: package.install_date,
                 size_bytes: package.size_bytes,
                 size_exact: package.size_exact,
+                files: package.files.clone(),
                 is_old,
                 status,
                 status_text,
@@ -509,10 +523,14 @@ pub fn search_text(package: &Driver) -> String {
         package.class.as_str(),
         &package.version.to_string(),
         package.signature.as_str(),
+        package.signer.as_str(),
+        package.extension_id.as_str(),
+        &format_install_date(package.install_date),
         package.in_use_text.as_str(),
         package.device_text.as_str(),
         &format_device_ids(&package.device_ids),
         package.status_text.as_str(),
+        &format_files(&package.files),
         package.folder.as_str(),
     ]
     .join(" ")
@@ -541,9 +559,13 @@ fn compare_by(sort_by: SortBy, a: &Driver, b: &Driver) -> Ordering {
         SortBy::Class => compare_ignore_case(&a.class, &b.class),
         SortBy::Version => a.version.cmp(&b.version),
         SortBy::Date => a.date.cmp(&b.date),
+        SortBy::InstallDate => a.install_date.cmp(&b.install_date),
         SortBy::SizeBytes => a.size_bytes.cmp(&b.size_bytes),
+        SortBy::FileCount => a.files.len().cmp(&b.files.len()),
         SortBy::BootCritical => a.boot_critical.cmp(&b.boot_critical),
         SortBy::Signature => a.signature.rank().cmp(&b.signature.rank()),
+        SortBy::Signer => compare_ignore_case(&a.signer, &b.signer),
+        SortBy::ExtensionId => compare_ignore_case(&a.extension_id, &b.extension_id),
         SortBy::InUse => a.in_use.cmp(&b.in_use),
         SortBy::DeviceText => compare_ignore_case(&a.device_text, &b.device_text),
         SortBy::DeviceId => compare_ignore_case(&format_device_ids(&a.device_ids), &format_device_ids(&b.device_ids)),
@@ -662,8 +684,31 @@ pub fn format_size_text(bytes: u64, exact: bool) -> String {
     }
 }
 
-/// The fourteen text sub-items of a row (one per column).
-pub fn row_texts(package: &Driver) -> [String; 14] {
+/// "-" when Windows gives no install date, otherwise "2026-09-03 14:30".
+pub fn format_install_date(install_date: Option<DateTime>) -> String {
+    install_date.map(format_date_time).unwrap_or_else(|| "-".to_string())
+}
+
+/// How many files the "Driver files" column names before it says "and N more files".
+const FILES_SHOWN: usize = 5;
+
+/// "3 files: a.cat, a.inf, a.sys" or "12 files: a, b, c, d, e and 7 more files". The names are sorted;
+/// the full list is the package folder ("Open package folder" in the right-click menu).
+pub fn format_files(files: &[String]) -> String {
+    if files.is_empty() {
+        return "-".to_string();
+    }
+    let shown = files.iter().take(FILES_SHOWN).map(|f| f.as_str()).collect::<Vec<_>>().join(", ");
+    let total = if files.len() == 1 { "1 file".to_string() } else { format!("{} files", files.len()) };
+    match files.len() - files.len().min(FILES_SHOWN) {
+        0 => format!("{total}: {shown}"),
+        1 => format!("{total}: {shown} and 1 more file"),
+        more => format!("{total}: {shown} and {more} more files"),
+    }
+}
+
+/// The eighteen text sub-items of a row (one per column).
+pub fn row_texts(package: &Driver) -> [String; 18] {
     [
         package.published_name.clone(),
         package.original_inf.clone(),
@@ -671,13 +716,17 @@ pub fn row_texts(package: &Driver) -> [String; 14] {
         package.class.clone(),
         package.version.to_string(),
         format_date(package.date),
-        format_size_text(package.size_bytes, package.size_exact),
-        if package.boot_critical { "Yes" } else { "No" }.to_string(),
+        format_install_date(package.install_date),
         package.signature.as_str().to_string(),
+        package.signer.clone(),
+        package.extension_id.clone(),
+        if package.boot_critical { "Yes" } else { "No" }.to_string(),
         package.in_use_text.clone(),
+        package.status_text.clone(),
         package.device_text.clone(),
         format_device_ids(&package.device_ids),
-        package.status_text.clone(),
+        format_size_text(package.size_bytes, package.size_exact),
+        format_files(&package.files),
         package.folder.clone(),
     ]
 }
@@ -733,9 +782,12 @@ mod tests {
             version: NetVersion::parse(ver).unwrap(),
             date: Date::from_ymd_opt(date.0, date.1, date.2).unwrap(),
             boot_critical: false,
-            signature: Signature::Signed,
+            signature: Signature(0x0D00_0005),
+            signer: "Microsoft Windows Hardware Compatibility Publisher".into(),
+            install_date: None,
             size_bytes: 1000,
             size_exact: true,
+            files: Vec::new(),
         }
     }
 
@@ -883,19 +935,26 @@ mod tests {
         let drivers = new_driver_records(&packages, &HashMap::new());
         let texts = row_texts(&drivers[0]);
         assert_eq!(texts.len(), COLUMN_DEFINITIONS.len());
-        assert_eq!(texts[13], drivers[0].folder);
-        assert_eq!(COLUMN_DEFINITIONS[13].title, "Driver path");
+        assert_eq!(texts[17], drivers[0].folder);
+        assert_eq!(COLUMN_DEFINITIONS[17].title, "Driver path");
         // Sorted by path: a.inf_x comes before b.inf_x. Found by a part of the path.
-        assert_eq!(visible_packages(&drivers, "", false, false, 13, false), vec![1, 0]);
+        assert_eq!(visible_packages(&drivers, "", false, false, 17, false), vec![1, 0]);
         assert_eq!(visible_packages(&drivers, "a.inf_x", false, false, 0, false), vec![1]);
     }
 
     #[test]
     fn signature_column_and_disconnected_filter() {
-        assert_eq!(Signature::from_dism(2), Signature::Signed);
-        assert_eq!(Signature::from_dism(1), Signature::Unsigned);
-        assert_eq!(Signature::from_dism(0), Signature::Unknown);
-        assert_eq!(Signature::from_dism(99), Signature::Unknown);
+        // The class names Windows gives the signer scores.
+        let name = |score: u32| Signature(score).as_str();
+        assert_eq!(name(0x0D00_0001), "Logo Premium");
+        assert_eq!(name(0x0D00_0002), "Logo Standard");
+        assert_eq!(name(0x0D00_0003), "Inbox");
+        assert_eq!(name(0x0D00_0004), "Unclassified");
+        assert_eq!(name(0x0D00_0005), "WHQL");
+        assert_eq!(name(0x0F00_0000), "Authenticode");
+        assert_eq!(name(0x8000_0000), "Unsigned");
+        assert_eq!(name(0xC000_0000), "Win9X Suspect");
+        assert_eq!(name(0x1234_5678), "Unknown");
 
         let mut packages = vec![
             raw("oem1.inf", "a.inf", "1.0.0.0", (2020, 1, 1)),
@@ -903,8 +962,8 @@ mod tests {
             raw("oem3.inf", "c.inf", "1.0.0.0", (2020, 1, 1)),
             raw("oem4.inf", "d.inf", "1.0.0.0", (2020, 1, 1)),
         ];
-        packages[1].signature = Signature::Unsigned;
-        packages[2].signature = Signature::Unknown;
+        packages[1].signature = Signature(0x8000_0000); // Unsigned
+        packages[2].signature = Signature(0x0F00_0000); // Authenticode
         let devices = map_of(&[
             device("Gone", "oem1.inf", &[], false, "USB\\GONE"),
             device("Here", "oem3.inf", &[], true, "USB\\HERE"),
@@ -917,10 +976,10 @@ mod tests {
         assert_eq!(visible_packages(&drivers, "", false, true, 0, false), vec![0]);
         assert_eq!(visible_packages(&drivers, "", false, false, 0, false), vec![0, 1, 2, 3]);
 
-        // The Signature column: text, sort (unsigned first), search.
-        assert_eq!(row_texts(&drivers[1])[8], "Unsigned");
-        assert_eq!(COLUMN_DEFINITIONS[8].title, "Signature");
-        assert_eq!(visible_packages(&drivers, "", false, false, 8, false), vec![1, 2, 0, 3]);
+        // The Signature column: the class name, sort (least trusted first), search.
+        assert_eq!(row_texts(&drivers[1])[7], "Unsigned");
+        assert_eq!(COLUMN_DEFINITIONS[7].title, "Signature");
+        assert_eq!(visible_packages(&drivers, "", false, false, 7, false), vec![1, 2, 0, 3]);
         assert_eq!(visible_packages(&drivers, "unsigned", false, false, 0, false), vec![1]);
     }
 
@@ -934,21 +993,75 @@ mod tests {
         let packages = vec![raw("oem1.inf", "a.inf", "1.0.0.0", (2020, 1, 1)), raw("oem2.inf", "a.inf", "2.0.0.0", (2021, 1, 1))];
         let devices = map_of(&[device("Wi-Fi", "oem1.inf", &[], true, "PCI\\A")]);
         let online = new_driver_records(&packages, &devices);
-        assert_eq!(row_texts(&online[0])[11], "PCI\\A");
-        assert_eq!(COLUMN_DEFINITIONS[11].title, "Device ID");
+        assert_eq!(row_texts(&online[0])[14], "PCI\\A");
+        assert_eq!(COLUMN_DEFINITIONS[14].title, "Device ID");
         assert_eq!(visible_packages(&online, "pci\\a", false, false, 0, false), vec![0]);
         assert!(online.iter().all(|d| d.usage_known));
 
         // Offline: usage is unknown, nothing counts as in use, the old/latest rules still work.
         let offline = new_offline_driver_records(&packages);
         assert!(offline.iter().all(|d| !d.usage_known && !d.in_use && !d.only_disconnected));
-        assert_eq!(row_texts(&offline[0])[8], "Signed");
+        assert_eq!(row_texts(&offline[0])[7], "WHQL");
         assert_eq!(offline[0].usage_text, "Unknown");
         assert_eq!(offline[0].in_use_text, "Unknown");
         assert_eq!(offline[0].device_text, "Unknown");
         assert!(offline[0].is_old && !offline[1].is_old);
         assert!(summary_text(&offline, 2).starts_with("OFFLINE IMAGE | 2 packages | 1 old (0 boot-critical)"));
         assert!(!summary_text(&online, 2).contains("OFFLINE"));
+    }
+
+    #[test]
+    fn the_new_columns() {
+        let titles: Vec<&str> = COLUMN_DEFINITIONS.iter().map(|c| c.title).collect();
+        assert_eq!(
+            titles,
+            [
+                "Published name", "Original INF", "Provider", "Class", "Version", "Date", "Install date (UTC)", "Signature", "Signer",
+                "Extension ID", "Boot-critical", "In use", "Status", "Devices", "Device ID", "Size", "Driver files", "Driver path"
+            ]
+        );
+
+        let mut packages = vec![
+            raw("oem1.inf", "a.inf", "1.0.0.0", (2020, 1, 1)),
+            raw("oem2.inf", "b.inf", "1.0.0.0", (2020, 1, 1)),
+            raw("oem3.inf", "c.inf", "1.0.0.0", (2020, 1, 1)),
+        ];
+        packages[0].install_date = DateTime::from_filetime((1_709_677_800u64 + 11_644_473_600) * 10_000_000);
+        packages[0].files = vec!["a.cat".into(), "a.inf".into()];
+        packages[0].extension_id = "{abcdef12-3456-7890-abcd-ef1234567890}".into();
+        packages[1].install_date = DateTime::from_filetime((1_609_459_200u64 + 11_644_473_600) * 10_000_000);
+        packages[1].signer = "Acme".into();
+        packages[1].files = (1..=9).map(|i| format!("f{i}.sys")).collect();
+        let drivers = new_driver_records(&packages, &HashMap::new());
+
+        let texts = row_texts(&drivers[0]);
+        assert_eq!(texts[6], "2024-03-05 22:30");
+        assert_eq!(texts[8], "Microsoft Windows Hardware Compatibility Publisher");
+        assert_eq!(texts[9], "{abcdef12-3456-7890-abcd-ef1234567890}");
+        assert_eq!(texts[16], "2 files: a.cat, a.inf");
+        assert_eq!(row_texts(&drivers[2])[6], "-"); // no install date
+        assert_eq!(row_texts(&drivers[2])[16], "-"); // no files
+
+        // Sorting: install date (none first), file count, signer, extension ID.
+        assert_eq!(visible_packages(&drivers, "", false, false, 6, false), vec![2, 1, 0]);
+        assert_eq!(visible_packages(&drivers, "", false, false, 16, true), vec![1, 0, 2]);
+        assert_eq!(visible_packages(&drivers, "", false, false, 8, false)[0], 1);
+        assert_eq!(visible_packages(&drivers, "", false, false, 9, true)[0], 0);
+        // Searching: signer, extension ID, install date and a file name that is shown.
+        assert_eq!(visible_packages(&drivers, "acme", false, false, 0, false), vec![1]);
+        assert_eq!(visible_packages(&drivers, "abcdef12", false, false, 0, false), vec![0]);
+        assert_eq!(visible_packages(&drivers, "2024-03-05", false, false, 0, false), vec![0]);
+        assert_eq!(visible_packages(&drivers, "a.cat", false, false, 0, false), vec![0]);
+    }
+
+    #[test]
+    fn files_column_text() {
+        let names = |n: usize| (1..=n).map(|i| format!("f{i}")).collect::<Vec<_>>();
+        assert_eq!(format_files(&[]), "-");
+        assert_eq!(format_files(&names(1)), "1 file: f1");
+        assert_eq!(format_files(&names(5)), "5 files: f1, f2, f3, f4, f5");
+        assert_eq!(format_files(&names(6)), "6 files: f1, f2, f3, f4, f5 and 1 more file");
+        assert_eq!(format_files(&names(12)), "12 files: f1, f2, f3, f4, f5 and 7 more files");
     }
 
     #[test]

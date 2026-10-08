@@ -1,6 +1,6 @@
 [package]
 name = "driverstoremanager"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 build = "build.rs"
 description = "DriverStore Manager - review, clean up, back up and install third-party driver packages in the Windows Driver Store."

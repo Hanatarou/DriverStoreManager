@@ -211,33 +211,33 @@ mod tests {
             sort_column: 6,
             sort_descending: true,
             window: Some(WindowState { left: -10, top: 20, width: 1200, height: 700, maximized: true }),
-            column_widths: (0..14).map(|i| if i % 3 == 0 { Some(100 + i as i32) } else { None }).collect(),
+            column_widths: (0..18).map(|i| if i % 3 == 0 { Some(100 + i as i32) } else { None }).collect(),
         };
-        assert_eq!(parse(&to_text(&settings), 6, 14), settings);
+        assert_eq!(parse(&to_text(&settings), 6, 18), settings);
         // No window block: no window state.
         let plain = Settings { window: None, ..settings };
-        assert_eq!(parse(&to_text(&plain), 6, 14), plain);
+        assert_eq!(parse(&to_text(&plain), 6, 18), plain);
     }
 
     #[test]
     fn bad_values_fall_back_to_defaults() {
         let text = "BackUpBeforeRemoving=maybe\nGroupBy=99\nSortColumn=-1\nShowOnlyOld=2\nShowOnlyDisconnected=x\nWindowLeft=1\nWindowTop=1\nWindowWidth=5\nWindowHeight=700\nnonsense\nUnknown=1\n";
-        let settings = parse(text, 6, 14);
+        let settings = parse(text, 6, 18);
         assert_eq!(settings, Settings::default());
         // The safe default: backups stay on unless the file clearly says 0.
-        assert!(parse("BackUpBeforeRemoving=\n", 6, 14).back_up);
+        assert!(parse("BackUpBeforeRemoving=\n", 6, 18).back_up);
         // Column widths: out-of-range index and widths are ignored.
-        let widths = parse("ColumnWidth0=50\nColumnWidth99=50\nColumnWidth1=5\nColumnWidth2=99999\nColumnWidthx=5\n", 6, 14).column_widths;
-        assert_eq!(widths.len(), 14);
+        let widths = parse("ColumnWidth0=50\nColumnWidth99=50\nColumnWidth1=5\nColumnWidth2=99999\nColumnWidthx=5\n", 6, 18).column_widths;
+        assert_eq!(widths.len(), 18);
         assert_eq!(widths[0], Some(50));
         assert!(widths[1..].iter().all(|w| w.is_none()));
-        assert!(parse("ColumnWidth1=5\n", 6, 14).column_widths.is_empty());
-        assert!(!parse("BackUpBeforeRemoving=0\n", 6, 14).back_up);
+        assert!(parse("ColumnWidth1=5\n", 6, 18).column_widths.is_empty());
+        assert!(!parse("BackUpBeforeRemoving=0\n", 6, 18).back_up);
     }
 
     #[test]
     fn tolerates_bom_comments_and_spaces() {
-        let settings = parse("\u{feff}; comment\r\n[Options]\r\n GroupBy = 2 \r\nSortDescending=1\r\n", 6, 14);
+        let settings = parse("\u{feff}; comment\r\n[Options]\r\n GroupBy = 2 \r\nSortDescending=1\r\n", 6, 18);
         assert_eq!(settings.group_mode, 2);
         assert!(settings.sort_descending);
     }
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn missing_file_gives_defaults() {
         let path = std::env::temp_dir().join(format!("dsm_missing_{}.ini", std::process::id()));
-        let (settings, warning) = load(&path, 6, 14);
+        let (settings, warning) = load(&path, 6, 18);
         assert_eq!(settings, Settings::default());
         assert!(warning.is_none());
     }

@@ -1,6 +1,6 @@
 //! Small pure helpers: sizes, dates, file names, message-box lists, case-insensitive search.
 
-use crate::date::Date;
+use crate::date::{Date, DateTime};
 
 use crate::culture;
 
@@ -26,6 +26,11 @@ pub fn format_size(bytes: f64) -> String {
 /// 2026-09-03, independent of the Windows language and calendar (Format-Date).
 pub fn format_date(date: Date) -> String {
     format!("{:04}-{:02}-{:02}", date.year, date.month, date.day)
+}
+
+/// 2026-09-03 14:30, independent of the Windows language and calendar.
+pub fn format_date_time(value: DateTime) -> String {
+    format!("{} {:02}:{:02}", format_date(value.date), value.hour, value.minute)
 }
 
 /// Replaces characters that are not allowed in Windows file names (Get-SafeFileName).

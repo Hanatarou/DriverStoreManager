@@ -15,6 +15,8 @@ mod proc;
 mod settings;
 
 #[cfg_attr(not(windows), allow(dead_code))]
+mod drvstore;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod native;
 
 #[cfg(windows)]

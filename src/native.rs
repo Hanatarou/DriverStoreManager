@@ -1,23 +1,18 @@
-//! Reads the Driver Store and the devices WITHOUT PowerShell.
+//! Devices, system information and the changes DISM makes to an OFFLINE image, WITHOUT PowerShell.
 //!
-//!  * Driver packages: the DISM API (`dismapi.dll`). `DismGetDrivers` is the function behind
-//!    `Get-WindowsDriver -Online`, so the data (published name, original INF, class, provider, version,
-//!    date, boot-critical flag) is the same the original PowerShell version showed.
 //!  * Devices: Configuration Manager (CfgMgr32), including devices that are not plugged in right now.
 //!    The device list gives which oemNN.inf each device uses, also through "extension" INFs.
 //!  * System information: build number from `RtlGetVersion` (not affected by manifests) and the product name.
+//!  * Adding and removing driver packages of an OFFLINE image: the DISM API (`dismapi.dll`).
 //!
-//! Nothing here changes the system. Changes go through `pnputil.exe` (see pnputil.rs).
-//!
-//! The DISM structure layout (4-byte packing, field order) follows the Windows SDK header `dismapi.h`.
-//! If DISM ever returned something that does not look like a driver package, reading stops with an error
-//! instead of showing (or removing) wrong packages.
+//! The driver packages themselves are read by `drvstore.rs`; this file keeps what it returns (`WindowsDriver`)
+//! and the checks on it. Everything on the running Windows is changed through `pnputil.exe` (see pnputil.rs).
 
-use crate::date::Date;
+use crate::date::{Date, DateTime};
 use crate::model::Signature;
 use crate::netversion::NetVersion;
 
-/// One entry of the DISM driver list (the properties the program uses).
+/// One entry of the Driver Store (the properties the program uses).
 #[derive(Clone, Debug)]
 pub struct WindowsDriver {
     /// "oem16.inf"
@@ -34,6 +29,11 @@ pub struct WindowsDriver {
     pub date: Date,
     pub boot_critical: bool,
     pub signature: Signature,
+    /// "{guid}" in lower case; empty for a package that is not an extension.
+    pub extension_id: String,
+    pub signer: String,
+    /// When the package was added to the Driver Store, in local time.
+    pub install_date: Option<DateTime>,
 }
 
 /// Which Windows is being managed: the one that is running, or an offline image (the root folder that
@@ -95,14 +95,14 @@ pub fn display_product_name(product: &str, build: i64) -> String {
     }
 }
 
-/// A path that DISM reports for an OFFLINE image can still name the drive the image had when it was running
+/// A path that the Driver Store reports for an OFFLINE image can still name the drive the image had when it was running
 /// ("C:\\Windows\\System32\\..."). The same path below the image root ("D:\\Windows\\System32\\...") is returned.
 pub fn rebase_to_image(path: &str, image_root: &str) -> Option<String> {
     let at = path.to_ascii_lowercase().find("\\windows\\")?;
     Some(format!("{}\\{}", image_root.trim_end_matches('\\'), &path[at + 1..]))
 }
 
-/// "oemNN.inf" (case-insensitive), the only names DISM may report for third-party packages.
+/// "oemNN.inf" (case-insensitive), the only names the Driver Store may report for third-party packages.
 pub fn looks_like_published_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     match lower.strip_prefix("oem").and_then(|rest| rest.strip_suffix(".inf")) {
@@ -111,9 +111,9 @@ pub fn looks_like_published_name(name: &str) -> bool {
     }
 }
 
-/// Plausibility check of one package read from DISM: only what a wrong structure layout would break (the
-/// names and the path). The DATE is deliberately not checked: INFs from some vendors carry very old or empty
-/// dates (a package with such a date is perfectly valid), and Get-WindowsDriver accepted them too.
+/// Plausibility check of one package read from the Driver Store: only what a wrong structure layout would break
+/// (the names and the path). The DATE is deliberately not checked: INFs from some vendors carry very old or
+/// empty dates (a package with such a date is perfectly valid), and Get-WindowsDriver accepted them too.
 pub fn validate_driver(driver: &WindowsDriver) -> Result<(), String> {
     let lower_file = driver.original_file_name.to_ascii_lowercase();
     let reason = if !looks_like_published_name(&driver.driver) {
@@ -130,7 +130,7 @@ pub fn validate_driver(driver: &WindowsDriver) -> Result<(), String> {
     match reason {
         None => Ok(()),
         Some(reason) => Err(format!(
-            "DISM returned data that does not look like a driver package ({reason}): '{}', '{}'. Nothing was loaded.",
+            "The Driver Store returned data that does not look like a driver package ({reason}): '{}', '{}'. Nothing was loaded.",
             driver.driver, driver.original_file_name
         )),
     }
@@ -140,52 +140,12 @@ pub fn validate_driver(driver: &WindowsDriver) -> Result<(), String> {
 /// counts as newer than another package.
 pub const UNKNOWN_DATE: Date = Date { year: 1, month: 1, day: 1 };
 
-/// SYSTEMTIME (8 x WORD), declared here so the layout can be checked on any platform.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SystemTime {
-    year: u16,
-    month: u16,
-    day_of_week: u16,
-    day: u16,
-    hour: u16,
-    minute: u16,
-    second: u16,
-    milliseconds: u16,
-}
-
-/// `DismDriverPackage` from dismapi.h. The header declares it with 4-byte packing, also on x64: pointers sit
-/// at offsets that are multiples of 4, not of 8.
-#[repr(C, packed(4))]
-#[derive(Clone, Copy)]
-#[cfg_attr(not(windows), allow(dead_code))]
-struct DismDriverPackage {
-    published_name: *const u16,
-    original_file_name: *const u16,
-    in_box: i32,
-    catalog_file: *const u16,
-    class_name: *const u16,
-    class_guid: *const u16,
-    class_description: *const u16,
-    boot_critical: i32,
-    driver_signature: i32,
-    provider_name: *const u16,
-    date: SystemTime,
-    major_version: u32,
-    minor_version: u32,
-    build: u32,
-    revision: u32,
-}
-
-// Offsets 0, 8, 16, 20, 28, 36, 44, 52, 56, 60, 68 (SYSTEMTIME, 16 bytes), 84, 88, 92, 96.
-const _: () = assert!(std::mem::size_of::<DismDriverPackage>() == 100);
-
-/// Reads a NUL-terminated UTF-16 string owned by DISM. A null pointer is an empty string.
+/// Reads a NUL-terminated UTF-16 string owned by the Driver Store. A null pointer is an empty string.
 ///
 /// # Safety
 /// `pointer` must be null or point to a NUL-terminated UTF-16 string.
 #[cfg_attr(not(windows), allow(dead_code))]
-unsafe fn read_wide(pointer: *const u16) -> String {
+pub unsafe fn read_wide(pointer: *const u16) -> String {
     if pointer.is_null() {
         return String::new();
     }
@@ -197,41 +157,8 @@ unsafe fn read_wide(pointer: *const u16) -> String {
     String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length))
 }
 
-/// One DISM package as a `WindowsDriver`.
-///
-/// # Safety
-/// The string pointers of `package` must each be null or point to a NUL-terminated UTF-16 string.
-#[cfg_attr(not(windows), allow(dead_code))]
-unsafe fn package_to_driver(package: DismDriverPackage) -> WindowsDriver {
-    let original_file_name = read_wide(package.original_file_name);
-    let (original_inf, folder) = split_path(&original_file_name);
-    let date = package.date;
-    let clamp = |v: u32| v.min(i32::MAX as u32) as i32;
-    WindowsDriver {
-        driver: read_wide(package.published_name),
-        original_file_name,
-        original_inf,
-        folder,
-        provider: read_wide(package.provider_name),
-        class: read_wide(package.class_name),
-        version: NetVersion {
-            major: clamp(package.major_version),
-            minor: clamp(package.minor_version),
-            build: clamp(package.build),
-            revision: clamp(package.revision),
-        },
-        // An empty or impossible date becomes UNKNOWN_DATE (the caller logs it).
-        date: Date::from_ymd_opt(date.year as i32, date.month as u32, date.day as u32).unwrap_or(UNKNOWN_DATE),
-        boot_critical: package.boot_critical != 0,
-        signature: Signature::from_dism(package.driver_signature),
-    }
-}
-
 #[cfg(windows)]
-pub use imp::{
-    add_drivers_offline, get_devices, get_system_info, get_windows_drivers, remove_driver_offline,
-    system_requirements_problem,
-};
+pub use imp::{add_drivers_offline, get_devices, get_system_info, remove_driver_offline};
 
 #[cfg(windows)]
 mod imp {
@@ -267,20 +194,16 @@ mod imp {
 
     type DismInitializeFn = unsafe extern "system" fn(i32, PCWSTR, PCWSTR) -> i32;
     type DismOpenSessionFn = unsafe extern "system" fn(PCWSTR, PCWSTR, PCWSTR, *mut u32) -> i32;
-    type DismGetDriversFn = unsafe extern "system" fn(u32, i32, *mut *const DismDriverPackage, *mut u32) -> i32;
     type DismAddDriverFn = unsafe extern "system" fn(u32, PCWSTR, i32) -> i32;
     type DismRemoveDriverFn = unsafe extern "system" fn(u32, PCWSTR) -> i32;
-    type DismDeleteFn = unsafe extern "system" fn(*const c_void) -> i32;
     type DismCloseSessionFn = unsafe extern "system" fn(u32) -> i32;
     type DismShutdownFn = unsafe extern "system" fn() -> i32;
 
     struct Dism {
         initialize: DismInitializeFn,
         open_session: DismOpenSessionFn,
-        get_drivers: DismGetDriversFn,
         add_driver: DismAddDriverFn,
         remove_driver: DismRemoveDriverFn,
-        delete: DismDeleteFn,
         close_session: DismCloseSessionFn,
         shutdown: DismShutdownFn,
     }
@@ -303,10 +226,8 @@ mod imp {
             Ok(Dism {
                 initialize: function!("DismInitialize", DismInitializeFn),
                 open_session: function!("DismOpenSession", DismOpenSessionFn),
-                get_drivers: function!("DismGetDrivers", DismGetDriversFn),
                 add_driver: function!("DismAddDriver", DismAddDriverFn),
                 remove_driver: function!("DismRemoveDriver", DismRemoveDriverFn),
-                delete: function!("DismDelete", DismDeleteFn),
                 close_session: function!("DismCloseSession", DismCloseSessionFn),
                 shutdown: function!("DismShutdown", DismShutdownFn),
             })
@@ -357,43 +278,6 @@ mod imp {
             (dism.shutdown)();
             result
         }
-    }
-
-    /// Third-party driver packages of the running Windows (Get-WindowsDriver -Online) or of an offline image.
-    pub fn get_windows_drivers(target: &ImageTarget) -> Result<Vec<WindowsDriver>> {
-        with_session(target, |dism, session| unsafe {
-            let mut packages: *const DismDriverPackage = std::ptr::null();
-            let mut count = 0u32;
-            // AllDrivers = FALSE: only third-party (oemNN.inf) packages, like Get-WindowsDriver.
-            let hr = (dism.get_drivers)(session, 0, &mut packages, &mut count);
-            if hr < 0 {
-                bail!("DISM could not list the driver packages: {}", hresult_text(hr));
-            }
-            let converted = (|| -> Result<Vec<WindowsDriver>> {
-                let mut drivers = Vec::with_capacity(count as usize);
-                if packages.is_null() {
-                    return Ok(drivers);
-                }
-                for package in std::slice::from_raw_parts(packages, count as usize) {
-                    let package = *package; // copy: the structure is packed
-                    let raw_date = package.date;
-                    let driver = package_to_driver(package);
-                    validate_driver(&driver).map_err(|e| anyhow!("{e}"))?;
-                    if driver.date == UNKNOWN_DATE {
-                        crate::applog::warn(&format!(
-                            "{} ({}): DISM reported the date {}-{}-{}, which is not a valid day. It is treated as 0001-01-01.",
-                            driver.driver, driver.original_inf, raw_date.year, raw_date.month, raw_date.day
-                        ));
-                    }
-                    drivers.push(driver);
-                }
-                Ok(drivers)
-            })();
-            if !packages.is_null() {
-                (dism.delete)(packages as *const c_void);
-            }
-            converted
-        })
     }
 
     /// Adds driver packages (given by the path of their .inf file) to an OFFLINE image. One result per file.
@@ -566,11 +450,6 @@ mod imp {
         let version = registry_text(w!("DisplayVersion")).map(|v| format!(" {v}")).unwrap_or_default();
         Ok(SystemInfo { caption: format!("{product}{version}"), build_number })
     }
-
-    /// Why the native readers cannot work on this computer, or None when everything is available.
-    pub fn system_requirements_problem() -> Option<String> {
-        dism().err().map(|e| format!("{e} It is part of Windows 10 and later."))
-    }
 }
 
 #[cfg(test)]
@@ -579,89 +458,6 @@ mod tests {
 
     fn utf16(text: &str) -> Vec<u8> {
         text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
-    }
-
-    #[test]
-    fn dism_structure_layout_matches_the_header() {
-        use std::mem::{offset_of, size_of};
-        assert_eq!(size_of::<SystemTime>(), 16);
-        assert_eq!(offset_of!(DismDriverPackage, published_name), 0);
-        assert_eq!(offset_of!(DismDriverPackage, original_file_name), 8);
-        assert_eq!(offset_of!(DismDriverPackage, in_box), 16);
-        assert_eq!(offset_of!(DismDriverPackage, catalog_file), 20);
-        assert_eq!(offset_of!(DismDriverPackage, class_name), 28);
-        assert_eq!(offset_of!(DismDriverPackage, class_guid), 36);
-        assert_eq!(offset_of!(DismDriverPackage, class_description), 44);
-        assert_eq!(offset_of!(DismDriverPackage, boot_critical), 52);
-        assert_eq!(offset_of!(DismDriverPackage, driver_signature), 56);
-        assert_eq!(offset_of!(DismDriverPackage, provider_name), 60);
-        assert_eq!(offset_of!(DismDriverPackage, date), 68);
-        assert_eq!(offset_of!(DismDriverPackage, major_version), 84);
-        assert_eq!(offset_of!(DismDriverPackage, minor_version), 88);
-        assert_eq!(offset_of!(DismDriverPackage, build), 92);
-        assert_eq!(offset_of!(DismDriverPackage, revision), 96);
-        assert_eq!(size_of::<DismDriverPackage>(), 100);
-    }
-
-    #[test]
-    fn converts_a_dism_package() {
-        fn z(text: &str) -> Vec<u16> {
-            text.encode_utf16().chain(std::iter::once(0)).collect()
-        }
-        let published = z("oem7.inf");
-        let file = z("C:\\Windows\\System32\\DriverStore\\FileRepository\\net.inf_amd64_1\\net.inf");
-        let provider = z("Intel(R) \u{dc}");
-        let class = z("Net");
-        let package = DismDriverPackage {
-            published_name: published.as_ptr(),
-            original_file_name: file.as_ptr(),
-            in_box: 0,
-            catalog_file: std::ptr::null(),
-            class_name: class.as_ptr(),
-            class_guid: std::ptr::null(),
-            class_description: std::ptr::null(),
-            boot_critical: 1,
-            driver_signature: 2,
-            provider_name: provider.as_ptr(),
-            date: SystemTime { year: 2024, month: 3, day_of_week: 2, day: 5, hour: 22, minute: 30, second: 0, milliseconds: 0 },
-            major_version: 31,
-            minor_version: 0,
-            build: 101,
-            revision: 4502,
-        };
-        let driver = unsafe { package_to_driver(package) };
-        assert_eq!(driver.driver, "oem7.inf");
-        assert_eq!(driver.original_inf, "net.inf");
-        assert_eq!(driver.folder, "C:\\Windows\\System32\\DriverStore\\FileRepository\\net.inf_amd64_1");
-        assert_eq!(driver.provider, "Intel(R) \u{dc}");
-        assert_eq!(driver.class, "Net");
-        assert_eq!(driver.version.to_string(), "31.0.101.4502");
-        assert_eq!(driver.date, Date::from_ymd_opt(2024, 3, 5).unwrap());
-        assert!(driver.boot_critical);
-        assert_eq!(driver.signature, Signature::Signed); // driver_signature: 2
-        assert!(validate_driver(&driver).is_ok());
-
-        // Null strings are empty and rejected by the validation (a wrong layout would look like this).
-        let broken = DismDriverPackage { published_name: std::ptr::null(), ..package };
-        let driver = unsafe { package_to_driver(broken) };
-        assert_eq!(driver.driver, "");
-        let error = validate_driver(&driver).unwrap_err();
-        assert!(error.contains("published name"), "{error}");
-
-        // An empty date, a very old date and a date in the 1990s are all valid packages.
-        for (year, month, day) in [(0u16, 0u16, 0u16), (1968, 1, 1), (1601, 1, 1), (2006, 6, 21)] {
-            let odd = DismDriverPackage {
-                date: SystemTime { year, month, day_of_week: 0, day, hour: 0, minute: 0, second: 0, milliseconds: 0 },
-                ..package
-            };
-            let driver = unsafe { package_to_driver(odd) };
-            assert!(validate_driver(&driver).is_ok(), "{year}-{month}-{day}");
-        }
-        let empty = DismDriverPackage {
-            date: SystemTime { year: 0, month: 0, day_of_week: 0, day: 0, hour: 0, minute: 0, second: 0, milliseconds: 0 },
-            ..package
-        };
-        assert_eq!(unsafe { package_to_driver(empty) }.date, UNKNOWN_DATE);
     }
 
     #[test]
@@ -726,7 +522,10 @@ mod tests {
             version: NetVersion::parse("1.2.3.4").unwrap(),
             date: Date::from_ymd_opt(2024, 3, 5).unwrap(),
             boot_critical: false,
-            signature: Signature::Signed,
+            signature: Signature(0x0D00_0005),
+            extension_id: String::new(),
+            signer: String::new(),
+            install_date: None,
         };
         assert!(validate_driver(&driver).is_ok());
         driver.date = UNKNOWN_DATE;

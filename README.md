@@ -50,7 +50,7 @@ Every item below is something the program does; the classification, selection, d
 - 🧭 **"Review" status:** when date and version disagree, the program does not guess. It never selects those packages automatically.
 - 🖨️ **`ntprint.inf` (print spooler) is never checked automatically.**
 - 🔒 **Link-safe folders:** the program runs elevated, so it refuses a `log` or `backup` folder that is a junction or symbolic link, and writes its settings file by replacing it, not by following a link.
-- 🧱 **Defensive reading:** a damaged settings file falls back to defaults, and DISM data that does not look like a driver package stops the load instead of showing wrong packages.
+- 🧱 **Defensive reading:** a damaged settings file falls back to defaults, and Driver Store data that does not look like a driver package stops the load instead of showing wrong packages.
 
 ### Correctness
 - 🧩 **Extension INFs count as "in use":** a package used through a device's extension INF is no longer shown as unused.
@@ -60,12 +60,13 @@ Every item below is something the program does; the classification, selection, d
 - 🗓️ Dates and times in logs and file names always use the same format (`yyyy-MM-dd HH:mm:ss` in logs, `yyyyMMdd_HHmmss` in file names), whatever the Windows calendar.
 
 ### Practical
-- ⚡ **No PowerShell, no WMI:** packages come from the DISM API (the function behind `Get-WindowsDriver`) and devices from the Windows Configuration Manager.
+- ⚡ **No PowerShell, no WMI:** packages come from the Windows Driver Store library (`drvstore.dll`, the one `pnputil` uses) and devices from the Windows Configuration Manager. It does not need DISM, so it also works where DISM is broken or stripped down (for example Windows PE).
 - 🪟 The window stays responsive during long copies and `pnputil` runs, and it cannot be closed in the middle of an operation.
 - 💾 Remembers your options, grouping, sorting, column widths and window position (`DriverStoreManager.ini`).
-- 💽 **Offline Windows images:** **File > Open offline Windows image…** manages the third-party drivers of a Windows on another disk (recovery, Windows PE): list, remove, add, export and restore, through the DISM API. Offline there are no devices, so *In use* is shown as *Unknown*, *Check unused packages* and *Add and install* are not available, and the backups go to a folder you choose.
-- 📤 CSV (opens correctly in Excel, UTF-8 with BOM) and JSON export of what is shown.
-- 🔏 **Signature** (Signed / Unsigned / Unknown, as DISM reports it), **Device ID** and **Driver path** columns, all sortable and searchable.
+- 💽 **Offline Windows images:** **File > Open offline Windows image…** manages the third-party drivers of a Windows on another disk (recovery, Windows PE): list and export read the image through `drvstore.dll`; add, remove and restore go through the DISM API. Offline there are no devices, so *In use* is shown as *Unknown*, *Check unused packages* and *Add and install* are not available, and the backups go to a folder you choose.
+- 📤 CSV (opens correctly in Excel, UTF-8 with BOM) and JSON export of what is shown: the same columns, titles and cell text as the window.
+- 🔏 **Signature** (the class Windows gives it: Logo Premium, Logo Standard, WHQL, Inbox, Unclassified, Authenticode, Unsigned…), **Signer**, **Install date (UTC)**, **Extension ID**, **Driver files** (the count and the first five names), **Device ID** and **Driver path** columns, all sortable and searchable.
+- 💬 Hover a cell that is cut off to see all of its text.
 - 🔌 **View > Show only packages used only by disconnected devices:** drivers whose hardware is not plugged in, good candidates for cleanup.
 
 ## 🔍 What it does *not* do (yet)
@@ -73,7 +74,6 @@ Every item below is something the program does; the classification, selection, d
 Being honest about the difference with Driver Store Explorer:
 
 - ❌ **English only.** This is intentional: driver operations are risky enough without adding translation problems.
-- ❌ No signer, install-date or package-file columns.
 - ❌ No automatic updates.
 
 ## 📦 Installation
@@ -127,11 +127,11 @@ To undo a removal, use **Drivers > Restore backup…** and pick its folder in `b
 
 ## 🔧 How it works
 
-- **Reading:** `dismapi.dll` (`DismGetDrivers`, third-party packages of the running Windows) and `cfgmgr32.dll` (all devices, including ones not plugged in, with their driver INF and extension INFs). The extension ID of each INF is read from the file.
+- **Reading:** `drvstore.dll` (the third-party packages of the running Windows or of an offline image, with their provider, version, date, signer, extension ID and install date) and `cfgmgr32.dll` (all devices, including ones not plugged in, with their driver INF and extension INFs). The library is not documented, so it is loaded from the System32 folder only, every function is looked up by name, every value is checked against its type and size, and reading stops with an error if the data does not look right.
 - **Changing:** only `pnputil.exe`, from the Windows system folder:
   - remove: `pnputil /delete-driver oemNN.inf /uninstall` (a package still in use is removed the same way; `/force` is not used because `pnputil` ignores it together with `/uninstall`),
   - add: `pnputil /add-driver <folder>\*.inf /subdirs [/install]`,
-  - offline images: `DismRemoveDriver` and `DismAddDriver` (pnputil only works on the running Windows),
+  - offline images: `DismRemoveDriver` and `DismAddDriver` (pnputil only works on the running Windows; DISM is only needed for this),
   - after a removal: `pnputil /scan-devices`.
 - **Old:** another package with the same class, provider, INF name and extension ID has a date and a version that are both not lower, and at least one higher; or an identical package is kept instead.
 
@@ -161,7 +161,7 @@ With `panic=abort` an unexpected internal error ends the program without a messa
 cargo test
 ```
 
-The unit tests cover the classification rules, device mapping, sorting and grouping, the DISM structure layout, settings, CSV/JSON output, folder safety, file copying, SHA-256 (against the published test vectors) and the backup manifest. They do not replace trying the program on a real machine.
+The unit tests cover the classification rules, device mapping, sorting and grouping, the Driver Store structure layouts and value checks, settings, CSV/JSON output, folder safety, file copying, SHA-256 (against the published test vectors) and the backup manifest. They do not replace trying the program on a real machine.
 
 To check the code on a machine without the Windows resource compiler, set `DSM_SKIP_RESOURCES=1` (the `.exe` then has no icon).
 

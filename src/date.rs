@@ -1,6 +1,6 @@
 //! Calendar dates and the local clock, without a date/time crate.
 //!
-//! `Date` is a calendar day, ordered by year, month, day.
+//! `Date` is a calendar day, ordered by year, month, day. `DateTime` is a day with the time to the minute.
 //! Times in file names and logs always use the same digits on every Windows (invariant culture).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -45,6 +45,49 @@ impl Date {
     }
 }
 
+/// A calendar day with the time of day to the minute (the "Install date (UTC)" of a package).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DateTime {
+    pub date: Date,
+    pub hour: u32,
+    pub minute: u32,
+}
+
+/// Days from 1601-01-01 (the start of a FILETIME) to 1970-01-01.
+const DAYS_1601_TO_1970: i64 = 134_774;
+
+/// (year, month, day) of a day counted from 1970-01-01 (civil-from-days, Howard Hinnant).
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = (yoe + era * 400 + if month <= 2 { 1 } else { 0 }) as i32;
+    (year, month, day)
+}
+
+impl DateTime {
+    /// A FILETIME (100-nanosecond ticks since 1601-01-01). None for 0, which Windows uses for "no value".
+    pub fn from_filetime(ticks: u64) -> Option<DateTime> {
+        if ticks == 0 {
+            return None;
+        }
+        let seconds = ticks / 10_000_000;
+        let days = (seconds / 86_400) as i64 - DAYS_1601_TO_1970;
+        let rest = seconds % 86_400;
+        let (year, month, day) = civil_from_days(days);
+        Some(DateTime {
+            date: Date::from_ymd_opt(year, month, day)?,
+            hour: (rest / 3_600) as u32,
+            minute: (rest % 3_600 / 60) as u32,
+        })
+    }
+}
+
 pub struct LocalTime {
     pub year: i32,
     pub month: u32,
@@ -72,18 +115,8 @@ pub fn local_now() -> LocalTime {
 #[cfg(not(windows))]
 pub fn local_now() -> LocalTime {
     let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
-    let days = seconds.div_euclid(86_400);
     let rest = seconds.rem_euclid(86_400);
-    // civil-from-days (Howard Hinnant)
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = (yoe + era * 400 + if month <= 2 { 1 } else { 0 }) as i32;
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
     LocalTime { year, month, day, hour: (rest / 3600) as u32, minute: (rest % 3600 / 60) as u32, second: (rest % 60) as u32 }
 }
 
@@ -131,6 +164,20 @@ mod tests {
         assert_eq!(Date::parse_iso("x"), None);
         assert!(Date::from_ymd_opt(2020, 12, 31) < Date::from_ymd_opt(2021, 1, 1));
         assert!(Date::from_ymd_opt(2021, 2, 1) > Date::from_ymd_opt(2021, 1, 31));
+    }
+
+    #[test]
+    fn filetime_to_date_and_time() {
+        // 2024-03-05 22:30:00 UTC is the Unix time 1709677800.
+        let ticks = (1_709_677_800u64 + 11_644_473_600) * 10_000_000;
+        let value = DateTime::from_filetime(ticks).unwrap();
+        assert_eq!(value, DateTime { date: Date::from_ymd_opt(2024, 3, 5).unwrap(), hour: 22, minute: 30 });
+        // The epoch of FILETIME itself, and the Unix epoch.
+        assert_eq!(DateTime::from_filetime(1).unwrap().date, Date::from_ymd_opt(1601, 1, 1).unwrap());
+        assert_eq!(DateTime::from_filetime(11_644_473_600 * 10_000_000).unwrap().date, Date::from_ymd_opt(1970, 1, 1).unwrap());
+        assert_eq!(DateTime::from_filetime(0), None); // "no value"
+        assert!(DateTime::from_filetime(u64::MAX).is_none()); // beyond year 9999
+        assert!(DateTime::from_filetime(ticks) < DateTime::from_filetime(ticks + 600_000_000)); // one minute later
     }
 
     #[test]

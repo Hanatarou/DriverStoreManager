@@ -7,7 +7,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::model::{APP_NAME, APP_VERSION, MINIMUM_WINDOWS_BUILD};
 use crate::native::{self, SystemInfo};
 use crate::win::{self, show_message, Icon};
-use crate::{app, applog, pnputil, proc, ui};
+use crate::{app, applog, drvstore, pnputil, proc, ui};
 
 /// Returns a list of problems that prevent the program from working (empty list = all good).
 fn requirement_problems(info: &SystemInfo) -> Vec<String> {
@@ -42,7 +42,7 @@ fn requirement_problems(info: &SystemInfo) -> Vec<String> {
         ));
     }
 
-    if let Some(problem) = native::system_requirements_problem() {
+    if let Some(problem) = drvstore::requirement_problem() {
         problems.push(problem);
     }
     problems

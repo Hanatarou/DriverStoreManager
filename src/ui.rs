@@ -21,7 +21,7 @@ use windows::Win32::UI::Controls::{
     LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVIS_STATEIMAGEMASK, LVITEMW,
     LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETCOLUMNWIDTH, LVM_SETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP,
     LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVNI_SELECTED,
-    LVN_COLUMNCLICK, LVN_ITEMCHANGED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES,
+    LVN_COLUMNCLICK, LVN_ITEMCHANGED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_LABELTIP,
     LVS_REPORT, LVS_SHOWSELALWAYS, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, PBM_SETPOS, PBM_SETRANGE32,
     PROGRESS_CLASSW, SBARS_SIZEGRIP, SB_GETRECT, SB_SETPARTS, SB_SETTEXTW, STATUSCLASSNAMEW, WC_LISTVIEWW,
 };
@@ -472,7 +472,7 @@ pub fn create_main_window(saved: Option<WindowState>) -> Result<()> {
             list,
             LVM_SETEXTENDEDLISTVIEWSTYLE,
             0,
-            (LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_CHECKBOXES | LVS_EX_DOUBLEBUFFER) as isize,
+            (LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_CHECKBOXES | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP) as isize,
         );
         for (index, definition) in COLUMN_DEFINITIONS.iter().enumerate() {
             let mut text = wide(definition.title);
@@ -515,12 +515,16 @@ pub fn create_main_window(saved: Option<WindowState>) -> Result<()> {
 
         // The shortcut keys are a convenience: when the table cannot be created (some minimal Windows setups),
         // the program still starts and everything stays reachable from the menus.
-        let accelerators = match CreateAcceleratorTableW(&[
+        // The table is a local, writable array on purpose: with the array written inline in the call, creating
+        // the table failed on some systems (error 998, ERROR_NOACCESS), seen in Windows PE (Strelec), probably
+        // because the compiler placed the constant array in read-only memory. Do not "simplify" this.
+        let mut entries = [
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0), key: VK_F5.0, cmd: ID_REFRESH },
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'E' as u16, cmd: ID_EXPORT_LIST },
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0), key: b'N' as u16, cmd: ID_ADD },
             ACCEL { fVirt: ACCEL_VIRT_FLAGS(FVIRTKEY.0 | FCONTROL.0 | FSHIFT.0), key: b'N' as u16, cmd: ID_ADD_INSTALL },
-        ]) {
+        ];
+        let accelerators = match CreateAcceleratorTableW(&mut entries) {
             Ok(table) => table,
             Err(error) => {
                 crate::applog::warn(&format!("The shortcut keys are not available (CreateAcceleratorTable): {error}"));
@@ -717,7 +721,7 @@ pub fn filter_text() -> String {
 
 /// What is needed to draw one row.
 pub struct RowData {
-    pub texts: [String; 14],
+    pub texts: [String; 18],
     pub color: Option<(u8, u8, u8)>,
     pub checked: bool,
     pub group: Option<usize>,
