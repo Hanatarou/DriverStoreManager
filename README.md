@@ -1,5 +1,13 @@
 # DriverStore Manager — Review, Back Up and Clean the Windows Driver Store
 
+[![Release](https://img.shields.io/github/v/release/Hanatarou/DriverStoreManager)](https://github.com/Hanatarou/DriverStoreManager/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/Hanatarou/DriverStoreManager/release.yml)](https://github.com/Hanatarou/DriverStoreManager/actions)
+[![Downloads (all releases)](https://img.shields.io/github/downloads/Hanatarou/DriverStoreManager/total?label=downloads%20%28all%29)](https://github.com/Hanatarou/DriverStoreManager/releases)
+[![Downloads (latest release)](https://img.shields.io/github/downloads/Hanatarou/DriverStoreManager/latest/total?label=downloads%20%28latest%29)](https://github.com/Hanatarou/DriverStoreManager/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/Hanatarou/DriverStoreManager)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue)
+![Language](https://img.shields.io/github/languages/top/Hanatarou/DriverStoreManager)
+
 ## 🤖 A Note on AI Usage
 
 I built this project alone, as a personal project, with substantial help from AI tools — mainly Claude, and also DeepSeek and Qwen. I believe knowledge only survives past us if it's shared, and that's the spirit behind releasing this for free.
