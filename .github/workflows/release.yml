@@ -31,8 +31,12 @@ jobs:
           name: DriverStoreManager
           path: target/x86_64-pc-windows-msvc/release/DriverStoreManager.exe
 
-      - name: Attach the executable to the release
+      - name: Attach a zip with the executable to the release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" target/x86_64-pc-windows-msvc/release/DriverStoreManager.exe --clobber
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          $zip = "DriverStoreManager-$tag.zip"
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/DriverStoreManager.exe" -DestinationPath $zip
+          gh release upload $tag $zip --clobber
