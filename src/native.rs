@@ -36,6 +36,15 @@ pub struct WindowsDriver {
     pub install_date: Option<DateTime>,
 }
 
+/// What DISM reports about one .inf file, installed or not (a file in a folder).
+#[derive(Clone, Debug)]
+pub struct InfInfo {
+    pub class: String,
+    pub provider: String,
+    pub version: NetVersion,
+    pub date: Date,
+}
+
 /// Which Windows is being managed: the one that is running, or an offline image (the root folder that
 /// contains the Windows folder, for example "D:\\").
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,7 +167,7 @@ pub unsafe fn read_wide(pointer: *const u16) -> String {
 }
 
 #[cfg(windows)]
-pub use imp::{add_drivers_offline, get_devices, get_system_info, remove_driver_offline};
+pub use imp::{add_drivers_offline, get_devices, get_inf_info, get_system_info, remove_driver_offline};
 
 #[cfg(windows)]
 mod imp {
@@ -198,6 +207,10 @@ mod imp {
     type DismRemoveDriverFn = unsafe extern "system" fn(u32, PCWSTR) -> i32;
     type DismCloseSessionFn = unsafe extern "system" fn(u32) -> i32;
     type DismShutdownFn = unsafe extern "system" fn() -> i32;
+    /// DismGetDriverInfo(Session, DriverPath, DismDriver** Driver, UINT* Count, DismDriverPackage** DriverPackage)
+    type DismGetDriverInfoFn = unsafe extern "system" fn(u32, PCWSTR, *mut *mut c_void, *mut u32, *mut *mut c_void) -> i32;
+    /// DismDelete(void* DismStructure): frees what the DISM API returned.
+    type DismDeleteFn = unsafe extern "system" fn(*mut c_void) -> i32;
 
     struct Dism {
         initialize: DismInitializeFn,
@@ -206,6 +219,8 @@ mod imp {
         remove_driver: DismRemoveDriverFn,
         close_session: DismCloseSessionFn,
         shutdown: DismShutdownFn,
+        get_driver_info: DismGetDriverInfoFn,
+        delete: DismDeleteFn,
     }
 
     static DISM: OnceLock<std::result::Result<Dism, String>> = OnceLock::new();
@@ -230,6 +245,8 @@ mod imp {
                 remove_driver: function!("DismRemoveDriver", DismRemoveDriverFn),
                 close_session: function!("DismCloseSession", DismCloseSessionFn),
                 shutdown: function!("DismShutdown", DismShutdownFn),
+                get_driver_info: function!("DismGetDriverInfo", DismGetDriverInfoFn),
+                delete: function!("DismDelete", DismDeleteFn),
             })
         }
     }
@@ -289,6 +306,97 @@ mod imp {
                 // ForceUnsigned = FALSE: an unsigned driver is refused, as it is everywhere else in this program.
                 let hr = unsafe { (dism.add_driver)(session, PCWSTR(wide.as_ptr()), 0) };
                 results.push((inf.clone(), if hr < 0 { Err(hresult_text(hr)) } else { Ok(()) }));
+                crate::proc::pump_throttled();
+            }
+            Ok(results)
+        })
+    }
+
+    /// DismDriverPackage (dismapi.h). The header packs the structures, so every field sits right after the
+    /// previous one at 4-byte steps (a pointer is not padded to 8 bytes).
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    struct DismDriverPackage {
+        published_name: *const u16,
+        original_file_name: *const u16,
+        in_box: i32,
+        catalog_file: *const u16,
+        class_name: *const u16,
+        class_guid: *const u16,
+        class_description: *const u16,
+        boot_critical: i32,
+        driver_signature: i32,
+        provider_name: *const u16,
+        /// SYSTEMTIME: year, month, day of week, day, hour, minute, second, milliseconds.
+        date: [u16; 8],
+        major: u32,
+        minor: u32,
+        build: u32,
+        revision: u32,
+    }
+
+    /// Text of a NUL-terminated UTF-16 string returned by DISM (empty for a null pointer).
+    unsafe fn dism_text(text: *const u16) -> String {
+        if text.is_null() {
+            return String::new();
+        }
+        let mut length = 0usize;
+        while length < 4096 && *text.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, length)).trim().to_string()
+    }
+
+    /// Reads the class, provider, version and date of the package DISM returned. The date and the version are
+    /// checked BEFORE any text is read: if the layout of the structure were not what is expected here, they
+    /// would not look like a date and a version, and nothing is read through the other pointers.
+    unsafe fn read_inf_info(package: *const DismDriverPackage) -> std::result::Result<InfInfo, String> {
+        let info = std::ptr::read_unaligned(package);
+        let (date, major, minor, build, revision) = (info.date, info.major, info.minor, info.build, info.revision);
+        let (year, month, day) = (date[0] as i32, date[1] as u32, date[3] as u32);
+        let plausible_date = (1980..=2200).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day);
+        let plausible_version = [major, minor, build, revision].iter().all(|&v| v <= i32::MAX as u32);
+        if !plausible_date || !plausible_version {
+            return Err("DISM returned data that does not look like a driver date and version, so it was not used.".to_string());
+        }
+        Ok(InfInfo {
+            class: dism_text(info.class_name),
+            provider: dism_text(info.provider_name),
+            version: NetVersion { major: major as i32, minor: minor as i32, build: build as i32, revision: revision as i32 },
+            date: Date { year, month, day },
+        })
+    }
+
+    /// Reads, with DISM, the class, provider, version and date of each .inf file. The files do not have to be
+    /// installed. One result per file; a file DISM cannot read gives an error text, not an error for the call.
+    pub fn get_inf_info(
+        target: &ImageTarget,
+        infs: &[std::path::PathBuf],
+    ) -> Result<Vec<(std::path::PathBuf, std::result::Result<InfInfo, String>)>> {
+        with_session(target, |dism, session| {
+            let mut results = Vec::with_capacity(infs.len());
+            for inf in infs {
+                let wide = crate::win::wide(&inf.to_string_lossy());
+                let mut drivers: *mut c_void = std::ptr::null_mut();
+                let mut count = 0u32;
+                let mut package: *mut c_void = std::ptr::null_mut();
+                let hr = unsafe { (dism.get_driver_info)(session, PCWSTR(wide.as_ptr()), &mut drivers, &mut count, &mut package) };
+                let outcome = if hr < 0 {
+                    Err(hresult_text(hr))
+                } else if package.is_null() {
+                    Err("DISM returned no package information.".to_string())
+                } else {
+                    unsafe { read_inf_info(package as *const DismDriverPackage) }
+                };
+                unsafe {
+                    if !drivers.is_null() {
+                        (dism.delete)(drivers);
+                    }
+                    if !package.is_null() {
+                        (dism.delete)(package);
+                    }
+                }
+                results.push((inf.clone(), outcome));
                 crate::proc::pump_throttled();
             }
             Ok(results)

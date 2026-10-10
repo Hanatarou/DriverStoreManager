@@ -41,6 +41,8 @@ thread_local! {
     static IMAGE: RefCell<ImageTarget> = const { RefCell::new(ImageTarget::Online) };
     /// Where backups of an offline image go (asked once per opened image).
     static OFFLINE_BACKUP_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// Protection keys of the packages the user protected (model::protection_key).
+    static PROTECTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 fn image() -> ImageTarget {
@@ -106,6 +108,7 @@ pub fn apply_settings(settings: &Settings) {
     ui::set_menu_checked(ID_DISCONNECTED_ONLY, settings.disconnected_only);
     ui::set_menu_checked(ID_PROBLEM_ONLY, settings.problem_only);
     ui::set_column_widths(&settings.column_widths);
+    PROTECTED.with(|p| *p.borrow_mut() = settings.protected.clone());
 }
 
 /// Called when the window is closing: remembers the options and the window position.
@@ -121,6 +124,7 @@ pub fn on_closing() {
         sort_column: SORT_COLUMN.with(|c| c.get()),
         sort_descending: SORT_DESCENDING.with(|d| d.get()),
         window: ui::window_state(),
+        protected: PROTECTED.with(|p| p.borrow().clone()),
     };
     if let Err(error) = settings::save(&settings_file(), &current) {
         applog::warn(&format!("The settings were not saved: {error}"));
@@ -299,6 +303,8 @@ pub fn on_command(id: u16) {
         ID_CTX_CHECK_GROUP => ui_action("Check group", false, || check_group(true)),
         ID_CTX_UNCHECK_GROUP => ui_action("Uncheck group", false, || check_group(false)),
         ID_CTX_REMOVE_SELECTED => ui_action("Remove selected driver packages", false, remove_selected_packages),
+        ID_CTX_PROTECT => ui_action("Protect or unprotect packages", false, toggle_protection),
+        ID_CTX_REMOVE_DEVICES => ui_action("Remove disconnected devices", false, remove_disconnected_devices),
         ID_CTX_EXPORT_SELECTED => ui_action("Export selected driver packages", false, export_selected_packages),
         ID_CTX_DEVICE_PROPS => ui_action("Open device properties", false, open_device_properties),
         ID_CTX_OPEN_FOLDER => ui_action("Open package folder", false, open_package_folder),
@@ -427,7 +433,7 @@ pub fn update_inventory() -> Result<()> {
     let raw = raw_packages(&target, drvstore::get_windows_drivers(&target)?)?;
     applog::info(&format!("Found {} packages.", raw.len()));
 
-    let drivers = if target.is_offline() {
+    let mut drivers = if target.is_offline() {
         // An offline image has no devices: nothing is asked, and "in use" is unknown.
         new_offline_driver_records(&raw)
     } else {
@@ -436,6 +442,12 @@ pub fn update_inventory() -> Result<()> {
         new_driver_records(&raw, &device_map)
     };
 
+    PROTECTED.with(|p| {
+        let keys = p.borrow();
+        for package in drivers.iter_mut() {
+            package.protected = keys.contains(&model::protection_key(package));
+        }
+    });
     let old: Vec<&Driver> = drivers.iter().filter(|d| d.is_old).collect();
     let review: Vec<&Driver> = drivers.iter().filter(|d| d.status == model::Status::Review).collect();
     if target.is_offline() {
@@ -601,7 +613,7 @@ fn invert_shown() -> Result<()> {
         let mut list = d.borrow_mut();
         for index in drivers {
             if let Some(p) = list.get_mut(index) {
-                p.checked = !p.checked;
+                p.checked = !p.checked && !p.protected;
             }
         }
     });
@@ -624,7 +636,8 @@ fn set_items_checked(rows: Vec<usize>, value: bool) -> Result<()> {
         let mut list = d.borrow_mut();
         for index in drivers {
             if let Some(p) = list.get_mut(index) {
-                p.checked = value;
+                // A protected package is never checked in bulk.
+                p.checked = value && !p.protected;
             }
         }
     });
@@ -784,15 +797,8 @@ fn export_list() -> Result<()> {
 // ---- Drivers > Add driver package... ---------------------------------------------------------------------
 
 /// Add driver package(s) to an OFFLINE image, one DISM call per .inf file.
-fn add_driver_packages_offline() -> Result<()> {
+fn add_driver_packages_offline(folder: PathBuf) -> Result<()> {
     let target = image();
-    let Some(folder) = win::browse_for_folder(
-        ui::form(),
-        "Select the folder that contains the driver package(s) (.inf files). Subfolders are searched too.",
-    ) else {
-        applog::info("Adding a driver package was cancelled by the user (folder dialog).");
-        return Ok(());
-    };
     let folder_text = path_text(&folder);
     let infs = fsops::list_inf_files(&folder).map_err(|e| anyhow!("Could not search '{}': {}", folder_text, clean_io(&e)))?;
     if infs.is_empty() {
@@ -833,20 +839,25 @@ fn add_driver_packages_offline() -> Result<()> {
 }
 
 fn add_driver_packages(install: bool) -> Result<()> {
-    if image().is_offline() {
-        if install {
-            show_message("'Add and install' is only for the running Windows: an offline image has no devices to install on. Use 'Add driver package...' instead.", Icon::Information);
-            return Ok(());
-        }
-        return add_driver_packages_offline();
+    let offline = image().is_offline();
+    if offline && install {
+        show_message("'Add and install' is only for the running Windows: an offline image has no devices to install on. Use 'Add driver package...' instead.", Icon::Information);
+        return Ok(());
     }
-    let Some(folder) = win::browse_for_folder(
+    let Some((folder, only_newer)) = win::browse_for_folder_with_option(
         ui::form(),
         "Select the folder that contains the driver package(s) (.inf files). Subfolders are searched too.",
+        "Add only newer packages",
     ) else {
         applog::info("Adding a driver package was cancelled by the user (folder dialog).");
         return Ok(());
     };
+    if only_newer {
+        return add_newer_driver_packages(install, folder);
+    }
+    if offline {
+        return add_driver_packages_offline(folder);
+    }
     let folder_text = path_text(&folder);
 
     let inf_count = fsops::count_inf_files(&folder)
@@ -890,6 +901,204 @@ fn add_driver_packages(install: bool) -> Result<()> {
         );
     }
     update_inventory()
+}
+
+// ---- Drivers > Add only newer driver packages... ---------------------------------------------------------
+
+/// Lines of a list, at most `max`, then "... and N more".
+fn limited_lines(lines: &[String], max: usize) -> String {
+    let mut shown: Vec<String> = lines.iter().take(max).cloned().collect();
+    if lines.len() > max {
+        shown.push(format!("  ... and {} more", lines.len() - max));
+    }
+    shown.join("\n")
+}
+
+/// The "Add only newer packages" box of the folder dialog is ticked: reads each .inf file of the folder (DISM
+/// does not need them installed) and decides with the same rules that mark old packages in the list
+/// (model::decide_additions): newer ones are added, older or identical ones are skipped, and the user is asked
+/// about the rest.
+fn add_newer_driver_packages(install: bool, folder: PathBuf) -> Result<()> {
+    let target = image();
+    let folder_text = path_text(&folder);
+    let infs = fsops::list_inf_files(&folder).map_err(|e| anyhow!("Could not search '{}': {}", folder_text, clean_io(&e)))?;
+    if infs.is_empty() {
+        applog::warn(&format!("No .inf files found in {folder_text}"));
+        show_message(&format!("No .inf files were found in:\n{folder_text}"), Icon::Warning);
+        return Ok(());
+    }
+    // The comparison needs the list as it is now.
+    update_inventory()?;
+
+    ui::set_busy(true);
+    ui::set_status_text("Reading the .inf files...");
+    let read = native::get_inf_info(&target, &infs);
+    ui::set_busy(false);
+    let read = read?;
+
+    let shown = |path: &Path| path.strip_prefix(&folder).map(path_text).unwrap_or_else(|_| path_text(path));
+    let candidates: Vec<std::result::Result<model::InfCandidate, String>> = read
+        .iter()
+        .map(|(path, outcome)| {
+            outcome.as_ref().map_err(|e| e.clone()).map(|info| model::InfCandidate {
+                path: path_text(path),
+                original_inf: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                class: info.class.clone(),
+                provider: info.provider.clone(),
+                version: info.version,
+                date: info.date,
+            })
+        })
+        .collect();
+    let decisions = model::decide_additions(&drivers_snapshot(), &candidates);
+
+    applog::info(&format!("Read {} .inf file(s) from {folder_text} with DISM:", infs.len()));
+    for (((path, _), candidate), decision) in read.iter().zip(&candidates).zip(&decisions) {
+        let data = match candidate {
+            Ok(c) => format!("class={} provider={} version={} date={}", c.class, c.provider, c.version, format_date(c.date)),
+            Err(error) => format!("not read: {error}"),
+        };
+        applog::info(&format!("  {}  {}  ->  {:?}", shown(path), data, decision));
+    }
+
+    let mut to_add: Vec<usize> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut to_ask: Vec<usize> = Vec::new();
+    for (index, decision) in decisions.iter().enumerate() {
+        match decision {
+            model::AddDecision::Add => to_add.push(index),
+            model::AddDecision::Skip(reason) => skipped.push(format!("  {} ({reason})", shown(&infs[index]))),
+            model::AddDecision::Ask(_) => to_ask.push(index),
+        }
+    }
+
+    if to_add.is_empty() && to_ask.is_empty() {
+        applog::info(&format!("Nothing to add: all {} .inf file(s) are skipped.", infs.len()));
+        show_message(
+            &format!(
+                "Nothing to add: none of the {} .inf file(s) in\n{folder_text}\nis newer than what is installed.\n\nSkipped:\n{}",
+                infs.len(),
+                limited_lines(&skipped, 12)
+            ),
+            Icon::Information,
+        );
+        return Ok(());
+    }
+
+    let mut question = format!(
+        "{} .inf file(s) in:\n{folder_text}\n\nTo add: {}.  Skipped (not newer): {}.  To decide: {}.\n\n",
+        infs.len(),
+        to_add.len(),
+        skipped.len(),
+        to_ask.len()
+    );
+    if install {
+        question.push_str("The files to add go into the Driver Store AND are installed on matching devices. Windows installs a package on a device only if it is the best match for it.");
+    } else {
+        question.push_str("The files to add go into the Driver Store only (no device will be changed).");
+    }
+    if !skipped.is_empty() {
+        question.push_str(&format!("\n\nSKIPPED - not newer than what is installed:\n{}", limited_lines(&skipped, 12)));
+    }
+    if !to_ask.is_empty() {
+        let lines: Vec<String> = to_ask.iter().map(|&i| format!("  {}", shown(&infs[i]))).collect();
+        question.push_str(&format!("\n\nTO DECIDE - you will be asked about each one next:\n{}", limited_lines(&lines, 12)));
+    }
+    if !confirm_action(&format!("{question}\n\nContinue?"), Icon::Question) {
+        applog::info("Adding newer driver packages was cancelled by the user (confirmation).");
+        return Ok(());
+    }
+
+    let mut chosen: Vec<usize> = to_add;
+    for &index in &to_ask {
+        let reason = match &decisions[index] {
+            model::AddDecision::Ask(reason) => reason.as_str(),
+            _ => "",
+        };
+        if confirm_action(
+            &format!("The rules cannot decide about this file:\n\n{}\n\n{reason}.\n\nAdd it?", shown(&infs[index])),
+            Icon::Question,
+        ) {
+            chosen.push(index);
+        } else {
+            applog::info(&format!("Not added (user's choice): {}", shown(&infs[index])));
+            skipped.push(format!("  {} (not added, your choice)", shown(&infs[index])));
+        }
+    }
+    chosen.sort_unstable();
+    if chosen.is_empty() {
+        show_message("Nothing was added.", Icon::Information);
+        return Ok(());
+    }
+
+    applog::info(&format!("Adding {} of {} .inf file(s) from {folder_text} (install on devices: {}).", chosen.len(), infs.len(), ps_bool(install)));
+    ui::set_busy(true);
+    ui::show_progress(chosen.len());
+    let (mut added, mut failed, mut reboot) = (0usize, 0usize, false);
+    let mut failures: Vec<String> = Vec::new();
+    if target.is_offline() {
+        ui::set_status_text("Adding driver package(s) to the image...");
+        let paths: Vec<PathBuf> = chosen.iter().map(|&i| infs[i].clone()).collect();
+        match native::add_drivers_offline(&target, &paths) {
+            Ok(results) => {
+                for (path, outcome) in results {
+                    match outcome {
+                        Ok(()) => added += 1,
+                        Err(error) => {
+                            failed += 1;
+                            applog::error(&format!("Could not add {}: {error}", path.display()));
+                            failures.push(format!("{}: {error}", shown(&path)));
+                        }
+                    }
+                    ui::step_progress();
+                }
+            }
+            Err(error) => {
+                ui::hide_progress();
+                ui::set_busy(false);
+                return Err(error);
+            }
+        }
+    } else {
+        for &index in &chosen {
+            ui::set_status_text(&format!("Adding {}...", shown(&infs[index])));
+            let mut arguments = vec!["/add-driver".to_string(), path_text(&infs[index])];
+            if install {
+                arguments.push("/install".to_string());
+            }
+            match pnputil::invoke(&arguments) {
+                Ok(result) if result.success => {
+                    added += 1;
+                    reboot |= result.reboot_required;
+                }
+                Ok(result) => {
+                    failed += 1;
+                    applog::error(&format!("Could not add {} (pnputil exit code {}).", infs[index].display(), result.exit_code));
+                    failures.push(format!("{} (exit code {})", shown(&infs[index]), result.exit_code));
+                }
+                Err(error) => {
+                    failed += 1;
+                    applog::error(&format!("Could not add {}: {error}", infs[index].display()));
+                    failures.push(format!("{}: {error}", shown(&infs[index])));
+                }
+            }
+            ui::step_progress();
+        }
+    }
+    ui::hide_progress();
+    ui::set_busy(false);
+
+    let mut summary = format!("Done: {added} added, {} skipped, {failed} failed.", skipped.len());
+    if failed > 0 {
+        summary.push_str(&format!("\n\nFailed:\n{}\n\nThe reason for each failure is in the log.", limited_lines(&failures.iter().map(|f| format!("  {f}")).collect::<Vec<_>>(), 8)));
+    }
+    if reboot {
+        summary.push_str("\n\nRestart the computer to finish.");
+    }
+    applog::info(&format!("Add newer finished: {added} added, {} skipped, {failed} failed.", skipped.len()));
+    update_inventory()?;
+    show_message(&summary, if failed == 0 { Icon::Information } else { Icon::Warning });
+    Ok(())
 }
 
 // ---- Drivers > Export ... --------------------------------------------------------------------------------
@@ -1273,9 +1482,158 @@ fn remove_selected_packages() -> Result<()> {
 
 /// Asks for confirmation (with the relevant warnings), checks that the Driver Store still matches the
 /// list, then removes.
+/// Right-click > Protect / Unprotect: if every selected package is protected they are all unprotected,
+/// otherwise they are all protected. A protected package is not checked by the automatic rules and is
+/// skipped by every removal.
+fn toggle_protection() -> Result<()> {
+    let selected = selected_packages();
+    if selected.is_empty() {
+        show_message("No rows are selected. Click a row (or several, with Ctrl or Shift) first.", Icon::Information);
+        return Ok(());
+    }
+    let protect = selected.iter().any(|p| !p.protected);
+    let keys: Vec<String> = selected.iter().map(model::protection_key).collect();
+    PROTECTED.with(|p| {
+        let mut list = p.borrow_mut();
+        list.retain(|k| !keys.contains(k));
+        if protect {
+            list.extend(keys.iter().cloned());
+        }
+    });
+    DRIVERS.with(|d| {
+        for package in d.borrow_mut().iter_mut() {
+            if keys.contains(&model::protection_key(package)) {
+                package.protected = protect;
+                if protect {
+                    package.checked = false;
+                }
+            }
+        }
+    });
+    applog::info(&format!(
+        "{} {} package(s): {}",
+        if protect { "Protected" } else { "Unprotected" },
+        keys.len(),
+        selected.iter().map(|p| format!("{} ({})", p.published_name, p.original_inf)).collect::<Vec<_>>().join(", ")
+    ));
+    update_view();
+    Ok(())
+}
+
+/// Right-click > Remove disconnected devices of selected packages...: removes, with `pnputil /remove-device`,
+/// the devices of the selected packages that are not plugged in. A disconnected device keeps its package "in
+/// use"; once it is removed the package can be cleaned up. The packages themselves are not removed. Just before
+/// the removal the devices are read again: one that is plugged in by now, or is not found any more, is skipped.
+fn remove_disconnected_devices() -> Result<()> {
+    if image().is_offline() {
+        show_message("Not available for an offline image: it has no devices.", Icon::Information);
+        return Ok(());
+    }
+    let selected = selected_packages();
+    if selected.is_empty() {
+        show_message("No rows are selected. Click a row (or several, with Ctrl or Shift) first.", Icon::Information);
+        return Ok(());
+    }
+    let mut devices: Vec<model::DeviceRef> = Vec::new();
+    for package in &selected {
+        for device in &package.absent_devices {
+            if !devices.iter().any(|d| d.instance_id.eq_ignore_ascii_case(&device.instance_id)) {
+                devices.push(device.clone());
+            }
+        }
+    }
+    if devices.is_empty() {
+        show_message("None of the selected packages is used by a disconnected device.", Icon::Information);
+        return Ok(());
+    }
+
+    let lines: Vec<String> = devices.iter().map(|d| format!("  {} ({})", d.name, d.instance_id)).collect();
+    if !confirm_action(
+        &format!(
+            "Remove {} disconnected device(s) from Windows?\n\nEach one is removed with pnputil /remove-device. Windows creates the device again, and installs a driver for it, the next time it is plugged in. The driver packages are not removed.\n\n{}\n\nContinue?",
+            devices.len(),
+            limited_lines(&lines, 12)
+        ),
+        Icon::Question,
+    ) {
+        applog::info("Removing disconnected devices was cancelled by the user.");
+        return Ok(());
+    }
+
+    ui::set_busy(true);
+    ui::set_status_text("Checking that the devices are still disconnected...");
+    let current = native::get_devices();
+    let current = match current {
+        Ok(list) => list,
+        Err(error) => {
+            ui::set_busy(false);
+            return Err(error);
+        }
+    };
+    let presence: HashMap<String, bool> = current.iter().map(|d| (d.instance_id.to_lowercase(), d.present)).collect();
+
+    let (mut removed, mut failed, mut reboot) = (0usize, 0usize, false);
+    let mut skipped: Vec<String> = Vec::new();
+    for device in &devices {
+        match presence.get(&device.instance_id.to_lowercase()) {
+            Some(false) => {}
+            Some(true) => {
+                applog::warn(&format!("Not removed, it is plugged in now: {}", device.instance_id));
+                skipped.push(format!("  {} (plugged in now)", device.name));
+                continue;
+            }
+            None => {
+                applog::warn(&format!("Not removed, it was not found any more: {}", device.instance_id));
+                skipped.push(format!("  {} (not found any more)", device.name));
+                continue;
+            }
+        }
+        ui::set_status_text(&format!("Removing {}...", device.name));
+        match pnputil::invoke(&["/remove-device".to_string(), device.instance_id.clone()]) {
+            Ok(result) if result.success => {
+                removed += 1;
+                reboot |= result.reboot_required;
+            }
+            Ok(result) => {
+                failed += 1;
+                applog::error(&format!("Could not remove {} (pnputil exit code {}).", device.instance_id, result.exit_code));
+            }
+            Err(error) => {
+                failed += 1;
+                applog::error(&format!("Could not remove {}: {error}", device.instance_id));
+            }
+        }
+    }
+    ui::set_busy(false);
+
+    applog::info(&format!("Disconnected devices: {removed} removed, {} skipped, {failed} failed.", skipped.len()));
+    let mut summary = format!("Done: {removed} device(s) removed, {} skipped, {failed} failed.", skipped.len());
+    if !skipped.is_empty() {
+        summary.push_str(&format!("\n\nSkipped:\n{}", limited_lines(&skipped, 8)));
+    }
+    if failed > 0 {
+        summary.push_str("\n\nThe reason for each failure is in the log.");
+    }
+    if reboot {
+        summary.push_str("\n\nRestart the computer to finish.");
+    }
+    update_inventory()?;
+    show_message(&summary, if failed == 0 { Icon::Information } else { Icon::Warning });
+    Ok(())
+}
+
 fn remove_packages(selected: Vec<Driver>, nothing_message: &str) -> Result<()> {
     if selected.is_empty() {
         show_message(nothing_message, Icon::Information);
+        return Ok(());
+    }
+    // Protected packages are never removed, however they were selected.
+    let (protected, selected): (Vec<Driver>, Vec<Driver>) = selected.into_iter().partition(|p| p.protected);
+    if selected.is_empty() {
+        show_message(
+            "Nothing was removed: every selected package is protected. Unprotect it first (right-click > Protect / Unprotect selected packages).",
+            Icon::Information,
+        );
         return Ok(());
     }
 
@@ -1357,6 +1715,15 @@ fn remove_packages(selected: Vec<Driver>, nothing_message: &str) -> Result<()> {
             "\n\nBOOT-CRITICAL: {} package(s) are needed to start Windows:\n{}",
             boot.len(),
             format_package_list(&pairs(&boot))
+        ));
+    }
+
+    if !protected.is_empty() {
+        let list: Vec<&Driver> = protected.iter().collect();
+        message.push_str(&format!(
+            "\n\nPROTECTED: {} selected package(s) are protected and will NOT be removed:\n{}",
+            list.len(),
+            format_package_list(&pairs(&list))
         ));
     }
 

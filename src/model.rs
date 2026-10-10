@@ -16,7 +16,7 @@ use crate::netversion::NetVersion;
 pub const APP_NAME: &str = "DriverStore Manager";
 /// Name used in file and folder names (no space): DriverStoreManager_<time>.log, DriverStoreManager.ini ...
 pub const APP_FILE_NAME: &str = "DriverStoreManager";
-pub const APP_VERSION: &str = "1.2.0.0";
+pub const APP_VERSION: &str = "1.3.0.0";
 
 /// The note about AI shown in Help > About (the README text, except "under MIT license").
 pub const AI_NOTICE: &str = "I built this project alone, as a personal project, with substantial help from AI tools — mainly Claude, and also DeepSeek and Qwen. I believe knowledge only survives past us if it's shared, and that's the spirit behind releasing this for free.\n\nI did this on my own time and dime, covering all costs myself, without asking anyone for donations.\n\nJust as I respect opinions against the use of AI, I expect the use of AI here — as a tool that helped me build this project — to be respected in return. Disrespect toward this work, toward me, or toward anyone else involved will not be tolerated.\n\nAll AI-generated content is reviewed and validated by me before being committed — I stand behind every decision to include code in this repository, regardless of how it was originally written. This project is still provided as-is, under MIT license, with no warranty of any kind.\n\nIf you're uncomfortable with AI-assisted code for any reason, you are under no obligation to use, contribute to, or engage with this project. No hard feelings — just move on.\n\nFor everyone else: bug reports and PRs are evaluated on their merits (does it work, is it correct), not on how the code was produced.";
@@ -217,7 +217,11 @@ pub struct Driver {
     pub device_text: String,
     /// Instance IDs of the devices bound to the package, devices that are plugged in first.
     pub device_ids: Vec<String>,
+    /// The devices bound to the package that are not plugged in right now.
+    pub absent_devices: Vec<DeviceRef>,
     pub checked: bool,
+    /// The user protected this package: no automatic rule checks it and a removal skips it.
+    pub protected: bool,
 }
 
 /// `[int](([string]$_.Driver) -replace '\D', '')`
@@ -480,15 +484,34 @@ fn build_records(raw: &[RawPackage], device_map: &HashMap<String, Vec<DeviceRef>
                 },
                 device_text: if usage_known { format_device_text(&device_names) } else { "Unknown".to_string() },
                 device_ids: device_ids.into_iter().map(|(_, id)| id).collect(),
+                absent_devices: devices.iter().filter(|d| !d.present).cloned().collect(),
                 checked: false,
+                protected: false,
             }
         })
         .collect()
 }
 
-/// True for the packages the automatic rules never check (see NEVER_AUTO_SELECT_INFS).
+/// What identifies a package in the protected list: published name, INF name and version, lower case. The
+/// published name alone is not enough: Windows reuses the oemNN numbers, so a new package could inherit the
+/// protection of one that was removed.
+pub fn protection_key(package: &Driver) -> String {
+    format!("{}|{}|{}", package.published_name, package.original_inf, package.version).to_lowercase()
+}
+
+/// The text of the Status column: the status, plus a mark when the package is protected.
+pub fn status_cell(package: &Driver) -> String {
+    if package.protected {
+        format!("{} (protected)", package.status_text)
+    } else {
+        package.status_text.clone()
+    }
+}
+
+/// True for the packages the automatic rules never check (see NEVER_AUTO_SELECT_INFS), and for protected ones.
 pub fn is_never_auto_selected(package: &Driver) -> bool {
-    NEVER_AUTO_SELECT_INFS.iter().any(|name| eq_ci(&package.original_inf, name))
+    package.protected
+        || NEVER_AUTO_SELECT_INFS.iter().any(|name| eq_ci(&package.original_inf, name))
 }
 
 /// "Check old packages" rule: only old (superseded or duplicate) packages; in-use and boot-critical ones only
@@ -522,6 +545,145 @@ pub fn is_package_listed(package: &Driver, list: &[Driver]) -> bool {
     })
 }
 
+// ---- Add only newer packages ------------------------------------------------------------------------
+
+/// One .inf file of the folder chosen in "Add only newer driver packages", as DISM read it.
+#[derive(Clone, Debug)]
+pub struct InfCandidate {
+    /// Full path of the .inf file.
+    pub path: String,
+    /// File name of the .inf ("netrtle.inf").
+    pub original_inf: String,
+    pub class: String,
+    pub provider: String,
+    pub version: NetVersion,
+    pub date: Date,
+}
+
+/// What to do with one .inf file of the folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddDecision {
+    /// Newer than what is installed (or nothing like it is installed): add it.
+    Add,
+    /// Not newer: not added. The text says why.
+    Skip(String),
+    /// The rules cannot decide: the user is asked. The text says why.
+    Ask(String),
+}
+
+fn candidate_as_raw(candidate: &InfCandidate) -> RawPackage {
+    RawPackage {
+        published_name: candidate.path.clone(),
+        number: 0,
+        original_inf: candidate.original_inf.clone(),
+        folder: String::new(),
+        // DISM does not give the extension ID of an .inf file: an extension package never matches one here.
+        extension_id: String::new(),
+        provider: candidate.provider.clone(),
+        class: candidate.class.clone(),
+        version: candidate.version,
+        date: candidate.date,
+        boot_critical: false,
+        signature: Signature(0),
+        signer: String::new(),
+        install_date: None,
+        size_bytes: 0,
+        size_exact: true,
+        files: Vec::new(),
+    }
+}
+
+fn driver_as_raw(package: &Driver) -> RawPackage {
+    RawPackage {
+        published_name: package.published_name.clone(),
+        number: package.number,
+        original_inf: package.original_inf.clone(),
+        folder: package.folder.clone(),
+        extension_id: package.extension_id.clone(),
+        provider: package.provider.clone(),
+        class: package.class.clone(),
+        version: package.version,
+        date: package.date,
+        boot_critical: package.boot_critical,
+        signature: package.signature,
+        signer: package.signer.clone(),
+        install_date: package.install_date,
+        size_bytes: package.size_bytes,
+        size_exact: package.size_exact,
+        files: Vec::new(),
+    }
+}
+
+fn describe_raw(package: &RawPackage) -> String {
+    format!("{} {} ({})", package.published_name, package.version, format_date(package.date))
+}
+
+fn is_identical_version(a: &RawPackage, b: &RawPackage) -> bool {
+    a.version == b.version && a.date == b.date
+}
+
+/// Decides, with the same rules that mark packages as old in the list, which .inf files of a folder to add.
+/// `candidates` has one entry per file, in order: what DISM read, or why it could not read it.
+///  1. Compared with the installed packages of the same driver (see `is_same_driver`): an installed package
+///     that is newer, or has the same version and date -> Skip; version and date that disagree -> Ask;
+///     otherwise Add. A file DISM could not read, or that has no provider, is also Ask.
+///  2. Among the files still marked Add, a file superseded by another one of them is Skip, and of identical
+///     files only the first stays.
+pub fn decide_additions(installed: &[Driver], candidates: &[Result<InfCandidate, String>]) -> Vec<AddDecision> {
+    let installed: Vec<RawPackage> = installed.iter().map(driver_as_raw).collect();
+    let raws: Vec<Option<RawPackage>> = candidates.iter().map(|c| c.as_ref().ok().map(candidate_as_raw)).collect();
+
+    let mut decisions: Vec<AddDecision> = candidates
+        .iter()
+        .zip(&raws)
+        .map(|(candidate, raw)| {
+            let (Ok(candidate), Some(raw)) = (candidate, raw) else {
+                let reason = candidate.as_ref().err().cloned().unwrap_or_default();
+                return AddDecision::Ask(format!("DISM could not read the file: {reason}"));
+            };
+            if candidate.provider.is_empty() {
+                return AddDecision::Ask("DISM gave no provider, so it cannot be compared with the installed packages".to_string());
+            }
+            let same: Vec<&RawPackage> = installed.iter().filter(|p| is_same_driver(raw, p)).collect();
+            if let Some(newer) = same.iter().find(|p| is_newer_version(p, raw)) {
+                return AddDecision::Skip(format!("superseded by installed {}", describe_raw(newer)));
+            }
+            if let Some(equal) = same.iter().find(|p| is_identical_version(p, raw)) {
+                return AddDecision::Skip(format!("same version and date already installed as {}", equal.published_name));
+            }
+            if let Some(other) = same.iter().find(|p| is_conflicting(raw, p)) {
+                return AddDecision::Ask(format!("version and date disagree with installed {}", describe_raw(other)));
+            }
+            AddDecision::Add
+        })
+        .collect();
+
+    // Among the files that are still to be added.
+    let to_add: Vec<usize> = (0..decisions.len()).filter(|&i| decisions[i] == AddDecision::Add).collect();
+    let mut updates: Vec<(usize, AddDecision)> = Vec::new();
+    for &i in &to_add {
+        let Some(this) = &raws[i] else { continue };
+        for &j in &to_add {
+            let Some(other) = &raws[j] else { continue };
+            if i == j || !is_same_driver(this, other) {
+                continue;
+            }
+            if is_newer_version(other, this) {
+                updates.push((i, AddDecision::Skip(format!("superseded by {} in the same folder", describe_raw(other)))));
+                break;
+            }
+            if is_identical_version(this, other) && j < i {
+                updates.push((i, AddDecision::Skip(format!("same version and date as {} in the same folder", other.published_name))));
+                break;
+            }
+        }
+    }
+    for (index, decision) in updates {
+        decisions[index] = decision;
+    }
+    decisions
+}
+
 // ---- List view -------------------------------------------------------------------------------------
 
 /// Text searched by the filter box (Get-SearchText).
@@ -532,6 +694,7 @@ pub fn search_text(package: &Driver) -> String {
         package.provider.as_str(),
         package.class.as_str(),
         &package.version.to_string(),
+        &format_date(package.date),
         package.signature.as_str(),
         package.signer.as_str(),
         package.extension_id.as_str(),
@@ -539,7 +702,7 @@ pub fn search_text(package: &Driver) -> String {
         package.in_use_text.as_str(),
         package.device_text.as_str(),
         &format_device_ids(&package.device_ids),
-        package.status_text.as_str(),
+        &status_cell(package),
         &format_files(&package.files),
         package.folder.as_str(),
     ]
@@ -736,7 +899,7 @@ pub fn row_texts(package: &Driver) -> [String; 18] {
         package.extension_id.clone(),
         if package.boot_critical { "Yes" } else { "No" }.to_string(),
         package.in_use_text.clone(),
-        package.status_text.clone(),
+        status_cell(package),
         package.device_text.clone(),
         format_device_ids(&package.device_ids),
         format_size_text(package.size_bytes, package.size_exact),
@@ -922,6 +1085,8 @@ mod tests {
         ]);
         let drivers = new_driver_records(&packages, &devices);
         assert_eq!(drivers[0].device_ids, vec!["USB\\HERE".to_string(), "USB\\GONE".to_string()]);
+        let absent: Vec<&str> = drivers[0].absent_devices.iter().map(|d| d.instance_id.as_str()).collect();
+        assert_eq!(absent, vec!["USB\\GONE"]);
         assert_eq!(drivers[0].in_use_text, "Yes (2)");
     }
 
@@ -955,6 +1120,85 @@ mod tests {
         // Sorted by path: a.inf_x comes before b.inf_x. Found by a part of the path.
         assert_eq!(visible_packages(&drivers, "", false, false, false, 17, false), vec![1, 0]);
         assert_eq!(visible_packages(&drivers, "a.inf_x", false, false, false, 0, false), vec![1]);
+    }
+
+    fn candidate(path: &str, inf: &str, ver: &str, date: (i32, u32, u32)) -> Result<InfCandidate, String> {
+        Ok(InfCandidate {
+            path: path.into(),
+            original_inf: inf.into(),
+            class: "Net".into(),
+            provider: "Intel".into(),
+            version: NetVersion::parse(ver).unwrap(),
+            date: Date::from_ymd_opt(date.0, date.1, date.2).unwrap(),
+        })
+    }
+
+    #[test]
+    fn additions_follow_the_rules_of_the_list() {
+        let packages = vec![raw("oem1.inf", "a.inf", "2.0.0.0", (2021, 1, 1))];
+        let installed = new_driver_records(&packages, &HashMap::new());
+        let candidates = vec![
+            candidate("old\\a.inf", "a.inf", "1.0.0.0", (2020, 1, 1)),   // older than installed
+            candidate("same\\a.inf", "a.inf", "2.0.0.0", (2021, 1, 1)),  // same version and date
+            candidate("new\\a.inf", "a.inf", "3.0.0.0", (2022, 1, 1)),   // newer
+            candidate("other\\b.inf", "b.inf", "1.0.0.0", (2019, 1, 1)), // nothing like it is installed
+            candidate("mixed\\a.inf", "a.inf", "3.0.0.0", (2019, 1, 1)), // version up, date down
+            Err("The system cannot find the file".to_string()),
+        ];
+        let decisions = decide_additions(&installed, &candidates);
+        assert!(matches!(&decisions[0], AddDecision::Skip(r) if r.contains("superseded by installed oem1.inf")));
+        assert!(matches!(&decisions[1], AddDecision::Skip(r) if r.contains("already installed as oem1.inf")));
+        // "new" is also superseded by nothing installed; it is the newest of the folder too
+        assert_eq!(decisions[2], AddDecision::Add);
+        assert_eq!(decisions[3], AddDecision::Add);
+        assert!(matches!(&decisions[4], AddDecision::Ask(r) if r.contains("disagree")));
+        assert!(matches!(&decisions[5], AddDecision::Ask(r) if r.contains("could not read")));
+    }
+
+    #[test]
+    fn additions_inside_the_folder_keep_only_the_newest_and_one_of_identical_files() {
+        let installed = new_driver_records(&[], &HashMap::new());
+        let candidates = vec![
+            candidate("v1\\a.inf", "a.inf", "1.0.0.0", (2020, 1, 1)),
+            candidate("v2\\a.inf", "a.inf", "2.0.0.0", (2021, 1, 1)),
+            candidate("v2copy\\a.inf", "a.inf", "2.0.0.0", (2021, 1, 1)),
+        ];
+        let decisions = decide_additions(&installed, &candidates);
+        assert!(matches!(&decisions[0], AddDecision::Skip(r) if r.contains("superseded by")));
+        assert_eq!(decisions[1], AddDecision::Add);
+        assert!(matches!(&decisions[2], AddDecision::Skip(r) if r.contains("same version and date")));
+    }
+
+    #[test]
+    fn a_file_without_provider_is_asked_about() {
+        let installed = new_driver_records(&[], &HashMap::new());
+        let mut c = candidate("x\\a.inf", "a.inf", "1.0.0.0", (2020, 1, 1)).unwrap();
+        c.provider.clear();
+        assert!(matches!(&decide_additions(&installed, &[Ok(c)])[0], AddDecision::Ask(r) if r.contains("no provider")));
+    }
+
+    #[test]
+    fn protected_package_is_marked_and_never_auto_selected() {
+        let packages = vec![raw("oem1.inf", "a.inf", "1.0.0.0", (2020, 1, 1)), raw("oem2.inf", "a.inf", "2.0.0.0", (2021, 1, 1))];
+        let mut drivers = new_driver_records(&packages, &HashMap::new());
+        assert!(is_auto_selectable(&drivers[0], true, true)); // old
+        assert_eq!(protection_key(&drivers[0]), "oem1.inf|a.inf|1.0.0.0");
+        drivers[0].protected = true;
+        assert!(!is_auto_selectable(&drivers[0], true, true));
+        assert!(!is_unused_selectable(&drivers[0], true));
+        assert!(row_texts(&drivers[0])[12].ends_with(" (protected)"));
+        assert!(!row_texts(&drivers[1])[12].contains("protected"));
+        assert_eq!(visible_packages(&drivers, "protected", false, false, false, 0, false), vec![0]);
+    }
+
+    #[test]
+    fn date_column_is_searched() {
+        let packages = vec![raw("oem1.inf", "a.inf", "1.0.0.0", (2020, 1, 1)), raw("oem2.inf", "b.inf", "1.0.0.0", (2021, 6, 15))];
+        let drivers = new_driver_records(&packages, &HashMap::new());
+        // The text of the Date column, exactly as the list shows it.
+        assert_eq!(row_texts(&drivers[1])[5], "2021-06-15");
+        assert_eq!(visible_packages(&drivers, "2021-06-15", false, false, false, 0, false), vec![1]);
+        assert_eq!(visible_packages(&drivers, "2020-01-01", false, false, false, 0, false), vec![0]);
     }
 
     #[test]

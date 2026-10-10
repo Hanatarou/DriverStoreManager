@@ -12,6 +12,9 @@ use crate::model::DEFAULT_GROUP_MODE;
 /// Largest settings file that is read. Anything beyond is ignored.
 const MAX_BYTES: usize = 16 * 1024;
 
+/// Most protected packages kept in the file.
+const MAX_PROTECTED: usize = 100;
+
 /// Position and size of the window when it is not maximized, in screen pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowState {
@@ -42,6 +45,8 @@ pub struct Settings {
     pub window: Option<WindowState>,
     /// Width of each column in 96-dpi pixels; empty = the default widths. One entry per column otherwise.
     pub column_widths: Vec<Option<i32>>,
+    /// Packages the user protected (see model::protection_key), lower case.
+    pub protected: Vec<String>,
 }
 
 impl Default for Settings {
@@ -57,6 +62,7 @@ impl Default for Settings {
             sort_descending: false,
             window: None,
             column_widths: Vec::new(),
+            protected: Vec::new(),
         }
     }
 }
@@ -91,6 +97,13 @@ pub fn parse(text: &str, group_modes: usize, columns: usize) -> Settings {
         }
         let Some((key, value)) = line.split_once('=') else { continue };
         let key = key.trim();
+        if key == "Protected" {
+            let value = value.trim().to_lowercase();
+            if !value.is_empty() && settings.protected.len() < MAX_PROTECTED && !settings.protected.contains(&value) {
+                settings.protected.push(value);
+            }
+            continue;
+        }
         if let Some(index) = key.strip_prefix("ColumnWidth").and_then(|n| n.parse::<usize>().ok()) {
             if index < columns {
                 widths[index] = parse_int(value, 30, 3000);
@@ -143,6 +156,12 @@ pub fn to_text(settings: &Settings) -> String {
             if let Some(width) = width {
                 text.push_str(&format!("ColumnWidth{index}={width}\r\n"));
             }
+        }
+    }
+    if !settings.protected.is_empty() {
+        text.push_str("[Protected]\r\n");
+        for key in settings.protected.iter().take(MAX_PROTECTED) {
+            text.push_str(&format!("Protected={key}\r\n"));
         }
     }
     if let Some(window) = settings.window {
@@ -218,6 +237,7 @@ mod tests {
             sort_descending: true,
             window: Some(WindowState { left: -10, top: 20, width: 1200, height: 700, maximized: true }),
             column_widths: (0..18).map(|i| if i % 3 == 0 { Some(100 + i as i32) } else { None }).collect(),
+            protected: vec!["oem42.inf|nvlddmkm.inf|31.0.101.5000".to_string()],
         };
         assert_eq!(parse(&to_text(&settings), 6, 18), settings);
         // No window block: no window state.

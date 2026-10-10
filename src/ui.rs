@@ -21,12 +21,12 @@ use windows::Win32::UI::Controls::{
     LVGF_GROUPID, LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVIS_STATEIMAGEMASK, LVITEMW,
     LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_GETCOLUMNWIDTH, LVM_SETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP,
     LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVNI_SELECTED,
-    LVN_COLUMNCLICK, LVN_ITEMCHANGED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_LABELTIP,
+    LVN_COLUMNCLICK, LVN_ITEMCHANGED, LVN_KEYDOWN, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_LABELTIP,
     LVS_REPORT, LVS_SHOWSELALWAYS, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, PBM_SETPOS, PBM_SETRANGE32,
     PROGRESS_CLASSW, SBARS_SIZEGRIP, SB_GETRECT, SB_SETPARTS, SB_SETTEXTW, STATUSCLASSNAMEW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus, VK_F5};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus, VK_DELETE, VK_F5};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, ACCEL, ACCEL_VIRT_FLAGS, FCONTROL, FSHIFT, FVIRTKEY, AppendMenuW, CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyWindow, GetClientRect, GetCursorPos, GetMenuState, GetWindowRect,
@@ -87,6 +87,8 @@ pub const ID_CTX_EXPORT_SELECTED: u16 = 245;
 pub const ID_CTX_DEVICE_PROPS: u16 = 246;
 pub const ID_CTX_COPY_CELL: u16 = 247;
 pub const ID_CTX_COPY_ROWS: u16 = 248;
+pub const ID_CTX_PROTECT: u16 = 249;
+pub const ID_CTX_REMOVE_DEVICES: u16 = 250;
 
 const ID_LIST: i32 = 1000;
 const ID_FILTER: u16 = 1001;
@@ -275,8 +277,10 @@ fn build_menus() -> Result<(HMENU, HMENU)> {
         .item(ID_CTX_CHECK_GROUP, "Check all in this group")
         .item(ID_CTX_UNCHECK_GROUP, "Uncheck all in this group")
         .separator()
-        .item(ID_CTX_REMOVE_SELECTED, "Remove selected packages...")
+        .item(ID_CTX_REMOVE_SELECTED, "Remove selected packages...\tDel")
         .item(ID_CTX_EXPORT_SELECTED, "Export selected packages...")
+        .item(ID_CTX_PROTECT, "Protect / Unprotect selected packages")
+        .item(ID_CTX_REMOVE_DEVICES, "Remove disconnected devices of selected packages...")
         .separator()
         .item(ID_CTX_DEVICE_PROPS, "Open device properties")
         .item(ID_CTX_OPEN_FOLDER, "Open package folder")
@@ -1040,6 +1044,13 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
                         app::on_column_click(n.iSubItem.max(0) as usize);
                         return LRESULT(0);
                     }
+                    LVN_KEYDOWN => {
+                        let k = &*(lparam.0 as *const KeyDownAlias);
+                        if k.vkey == VK_DELETE.0 {
+                            app::on_command(ID_CTX_REMOVE_SELECTED);
+                            return LRESULT(0);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1086,6 +1097,13 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
 
 /// NMLISTVIEW, under a local name so the match arms above read clearly.
 type NMListViewAlias = NMLISTVIEW;
+
+/// NMLVKEYDOWN: the notification header followed by the virtual-key code.
+#[repr(C)]
+struct KeyDownAlias {
+    hdr: NMHDR,
+    vkey: u16,
+}
 
 /// Row colors: the background of an item is its package color (Get-RowColor).
 unsafe fn custom_draw(lparam: LPARAM) -> LRESULT {

@@ -57,6 +57,7 @@ Every item below is something the program does; the classification, selection, d
 - ❓ **Confirmation defaults to No,** with specific warnings: still in use, not old, unused but latest, boot-critical.
 - 🧭 **"Review" status:** when date and version disagree, the program does not guess. It never selects those packages automatically.
 - 🖨️ **`ntprint.inf` (print spooler) is never checked automatically.**
+- 🔒 **Protect a package** (right-click > *Protect / Unprotect selected packages*): it is never checked by the bulk selections (*Check old*, *Check unused*, *Check shown*, *Check group*, *Invert*), and every removal skips it, even if you tick its box by hand. Shown as `(protected)` in the Status column and saved in `DriverStoreManager.ini`. The protection is tied to that exact package (name, INF and version), so a newer version of the same driver is not protected.
 - 🔒 **Link-safe folders:** the program runs elevated, so it refuses a `log` or `backup` folder that is a junction or symbolic link, and writes its settings file by replacing it, not by following a link.
 - 🧱 **Defensive reading:** a damaged settings file falls back to defaults, and Driver Store data that does not look like a driver package stops the load instead of showing wrong packages.
 
@@ -71,7 +72,9 @@ Every item below is something the program does; the classification, selection, d
 - ⚡ **No PowerShell, no WMI:** packages come from the Windows Driver Store library (`drvstore.dll`, the one `pnputil` uses) and devices from the Windows Configuration Manager. It does not need DISM, so it also works where DISM is broken or stripped down (for example Windows PE).
 - 🪟 The window stays responsive during long copies and `pnputil` runs, and it cannot be closed in the middle of an operation.
 - 💾 Remembers your options, grouping, sorting, column widths and window position (`DriverStoreManager.ini`).
-- 💽 **Offline Windows images:** **File > Open offline Windows image…** manages the third-party drivers of a Windows on another disk (recovery, Windows PE): list and export read the image through `drvstore.dll`; add, remove and restore go through the DISM API. Offline there are no devices, so *In use* is shown as *Unknown*, *Check unused packages* and *Add and install* are not available, and the backups go to a folder you choose.
+- 👻 **Remove disconnected devices** (right-click > *Remove disconnected devices of selected packages…*, running Windows only): a device that is not plugged in keeps its package "in use". This removes those devices with `pnputil /remove-device` so the package can be cleaned up afterwards. The devices are read again just before, and one that is plugged in by now is skipped. The packages themselves are not removed; Windows creates a device again, and installs a driver for it, the next time it is plugged in.
+- ⬆️ **Add only newer packages:** in the folder dialog of **Drivers > Add driver package…** and **Add and install driver package…**, tick *Add only newer packages* (unticked by default). The program reads every `.inf` of the folder with DISM (no need to install them) and compares each one with the Driver Store using the same rules that mark packages as *Old* in the list. Newer ones are added; older or identical ones are skipped, and the confirmation lists each skipped file and why. When the rules cannot decide (version and date disagree, DISM cannot read the file or gives no provider), you are asked about that file. Extension INFs are always treated as new (DISM does not report the extension ID). With the box unticked, everything in the folder is added, for example to go back to an older driver.
+- 💽 **Offline Windows images:** **File > Open offline Windows image…** manages the third-party drivers of a Windows on another disk (recovery, Windows PE): list and export read the image through `drvstore.dll`; add, remove and restore go through the DISM API. Offline there are no devices, so *In use* is shown as *Unknown*, *Check unused packages*, *Add and install* are not available, and the backups go to a folder you choose.
 - 📤 CSV (opens correctly in Excel, UTF-8 with BOM) and JSON export of what is shown: the same columns, titles and cell text as the window.
 - 🔏 **Signature** (the class Windows gives it: Logo Premium, Logo Standard, WHQL, Inbox, Unclassified, Authenticode, Unsigned…), **Signer**, **Install date (UTC)**, **Extension ID**, **Driver files** (the count and the first five names), **Device ID** and **Driver path** columns, all sortable and searchable.
 - 💬 Hover a cell that is cut off to see all of its text.
@@ -109,13 +112,13 @@ The program keeps these next to the `.exe`:
 ### Menus
 
 - **File:** Refresh (`F5`), Export list (`Ctrl+E`), Open offline Windows image, Return to the running Windows, open log and backup folders.
-- **Drivers:** Add driver package (`Ctrl+N`), Add and install (`Ctrl+Shift+N`), Export checked/all, Restore backup, Verify backup, Remove checked.
+- **Drivers:** Add driver package (`Ctrl+N`), Add and install (`Ctrl+Shift+N`) (both with the *Add only newer* option in the folder dialog), Export checked/all, Restore backup, Verify backup, Remove checked.
 - **Select:**
   - *Check old packages (unused only - safe)* — the recommended starting point.
   - *Check old packages (including in use)*, *Check unused packages* (any age), check/uncheck shown, invert, uncheck all.
 - **View:** Group by (class, provider, INF, usage, status), Show only old packages, Show only packages used only by disconnected devices, Show only packages used by devices with a problem, Go to the filter box (`Ctrl+F`).
 - **Options:** Back up before removing (on by default), include boot-critical packages in automatic selections (off).
-- **Right-click on a row:** check/uncheck a group, remove or export the selected rows, open device properties, open the package folder, copy its path, copy the text of the clicked cell, copy the selected rows (tab-separated, with the column titles).
+- **Right-click on a row:** check/uncheck a group, protect, remove (also with the `Del` key) or export the selected rows, remove their disconnected devices, open device properties, open the package folder, copy its path, copy the text of the clicked cell, copy the selected rows (tab-separated, with the column titles).
 
 ### Row colors (never the only signal — the *In use* and *Status* columns say the same in text)
 

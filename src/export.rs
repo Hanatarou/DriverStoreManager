@@ -116,7 +116,9 @@ mod tests {
             in_use_text: "No".into(),
             device_text: "-".into(),
             device_ids: Vec::new(),
+            absent_devices: Vec::new(),
             checked: false,
+            protected: false,
         }
     }
 

@@ -370,7 +370,9 @@ mod tests {
             in_use_text: String::new(),
             device_text: String::new(),
             device_ids: Vec::new(),
+            absent_devices: Vec::new(),
             checked: false,
+            protected: false,
         };
         let dest = base.join("dest");
         let copied = copy_driver_package(&package, &dest).unwrap();

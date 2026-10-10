@@ -7,7 +7,7 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
-use windows::core::{w, HSTRING, PCWSTR, PWSTR};
+use windows::core::{w, Interface, HSTRING, PCWSTR, PWSTR};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
@@ -24,8 +24,9 @@ use windows::Win32::System::Ole::{OleInitialize, CF_UNICODETEXT};
 use windows::Win32::System::Threading::{GetCurrentProcess, IsWow64Process};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FileSaveDialog, IFileSaveDialog, SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
-    BROWSEINFOW, FOS_FORCEFILESYSTEM, FOS_NOREADONLYRETURN, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, SIGDN_FILESYSPATH,
+    FileOpenDialog, FileSaveDialog, IFileDialogCustomize, IFileOpenDialog, IFileSaveDialog, SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+    BROWSEINFOW, FOS_FORCEFILESYSTEM, FOS_NOREADONLYRETURN, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
+    SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MessageBoxW, PeekMessageW, PostQuitMessage, TranslateMessage, MB_DEFBUTTON2,
@@ -228,6 +229,47 @@ pub fn browse_for_folder(owner: HWND, description: &str) -> Option<PathBuf> {
         }
         let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
         Some(PathBuf::from(OsString::from_wide(&path[..end])))
+    }
+}
+
+/// The folder dialog of Windows Vista and later with one check box under the folder list. Returns the folder
+/// and whether the box was ticked (it starts unticked), or None when the user cancels. If that dialog cannot
+/// be created, the classic folder dialog is used instead (without the box) and the reason goes to the log.
+pub fn browse_for_folder_with_option(owner: HWND, title: &str, option_label: &str) -> Option<(PathBuf, bool)> {
+    match pick_folder_with_option(owner, title, option_label) {
+        Ok(result) => result,
+        Err(error) => {
+            crate::applog::warn(&format!("The folder dialog with the option could not be used ({error}); the classic dialog is used."));
+            browse_for_folder(owner, title).map(|path| (path, false))
+        }
+    }
+}
+
+fn pick_folder_with_option(owner: HWND, title: &str, option_label: &str) -> Result<Option<(PathBuf, bool)>> {
+    const OPTION_ID: u32 = 1;
+    /// HRESULT_FROM_WIN32(ERROR_CANCELLED)
+    const CANCELLED: u32 = 0x8007_04C7;
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| anyhow!("The folder dialog could not be created: {e}"))?;
+        let options = dialog.GetOptions().map_err(|e| anyhow!("{e}"))?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST).map_err(|e| anyhow!("{e}"))?;
+        dialog.SetTitle(&HSTRING::from(title)).map_err(|e| anyhow!("{e}"))?;
+        let custom: IFileDialogCustomize = dialog.cast().map_err(|e| anyhow!("{e}"))?;
+        custom.AddCheckButton(OPTION_ID, &HSTRING::from(option_label), false).map_err(|e| anyhow!("{e}"))?;
+
+        if let Err(error) = dialog.Show(Some(owner)) {
+            if error.code().0 as u32 == CANCELLED {
+                return Ok(None);
+            }
+            return Err(anyhow!("{error}"));
+        }
+        let result = dialog.GetResult().map_err(|e| anyhow!("{e}"))?;
+        let name = result.GetDisplayName(SIGDN_FILESYSPATH).map_err(|e| anyhow!("{e}"))?;
+        let path = PathBuf::from(OsString::from_wide(name.as_wide()));
+        CoTaskMemFree(Some(name.0 as *const _));
+        let ticked = custom.GetCheckButtonState(OPTION_ID).map_err(|e| anyhow!("{e}"))?.as_bool();
+        Ok(Some((path, ticked)))
     }
 }
 
